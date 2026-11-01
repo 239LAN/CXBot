@@ -14,7 +14,14 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 TEMPLATE = ROOT / "scripts" / "install.sh"
 
-INCLUDE_FILES = ("main.py", "config.py", "requirements.txt", ".env.example")
+INCLUDE_FILES = (
+    "main.py",
+    "config.py",
+    "requirements.txt",
+    ".env.example",
+    "README.md",
+    "LICENSE",
+)
 INCLUDE_DIRS = ("bot", "services", "scripts")
 SKIP_RELATIVE = {"scripts/install.sh"}
 SKIP_PARTS = {"__pycache__"}
