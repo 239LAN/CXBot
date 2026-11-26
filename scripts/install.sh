@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # CXBot 自解压安装脚本（Linux）
 # 用法：sudo bash cxbot-install.sh [--prefix /opt/cxbot] [--user cxbot] [--no-start]
+
+# 兼容被 sh 误调用的情况：自动切回 bash，避免 [[ 等 bash 语法报错
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1 && [ -f "$0" ]; then
+        exec bash "$0" "$@"
+    fi
+    echo "本脚本需要 bash 运行，请改用：sudo bash $0" >&2
+    exit 1
+fi
+
 set -Eeuo pipefail
 
 APP_NAME="CXBot"
