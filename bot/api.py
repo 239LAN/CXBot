@@ -87,8 +87,15 @@ class QQBotAPI:
         content: str,
         msg_id: str | None = None,
         msg_seq: int = 1,
+        markdown: bool = False,
     ) -> dict:
-        payload: dict = {"content": content, "msg_type": 0}
+        if markdown:
+            payload: dict = {
+                "msg_type": 2,
+                "markdown": {"content": content},
+            }
+        else:
+            payload = {"content": content, "msg_type": 0}
         if msg_id:
             payload["msg_id"] = msg_id
             payload["msg_seq"] = msg_seq
@@ -129,8 +136,15 @@ class QQBotAPI:
         content: str,
         msg_id: str | None = None,
         msg_seq: int = 1,
+        markdown: bool = False,
     ) -> dict:
-        payload: dict = {"content": content, "msg_type": 0}
+        if markdown:
+            payload: dict = {
+                "msg_type": 2,
+                "markdown": {"content": content},
+            }
+        else:
+            payload = {"content": content, "msg_type": 0}
         if msg_id:
             payload["msg_id"] = msg_id
             payload["msg_seq"] = msg_seq

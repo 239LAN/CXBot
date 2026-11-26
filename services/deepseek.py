@@ -45,15 +45,22 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
+        system_suffix: str = "",
     ) -> dict:
-        messages = [{"role": "system", "content": self._config.system_prompt}]
+        system_content = self._config.system_prompt
+        if system_suffix:
+            system_content = f"{system_content}\n{system_suffix}"
+        messages = [{"role": "system", "content": system_content}]
         messages.extend(history)
-        limit = self._config.deepseek_max_tokens
-        if tools:
-            limit = max(limit, self._config.deepseek_tool_max_tokens)
-        effective_max = limit
         if max_tokens is not None:
-            effective_max = min(limit, max(1, int(max_tokens)))
+            # 调用方已按用户额度/管理员上限算好本次输出上限，直接采用
+            effective_max = max(1, int(max_tokens))
+        else:
+            effective_max = self._config.deepseek_max_tokens
+            if tools:
+                effective_max = max(
+                    effective_max, self._config.deepseek_tool_max_tokens
+                )
         payload: dict = {
             "model": self._config.deepseek_model,
             "messages": messages,
@@ -99,6 +106,7 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
+        system_suffix: str = "",
     ) -> tuple[str, dict]:
         """非流式对话，返回 (完整回复, usage)。
 
@@ -112,6 +120,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
+            system_suffix=system_suffix,
         )
 
         async with self._session.post(
@@ -147,6 +156,7 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
+        system_suffix: str = "",
     ) -> AsyncIterator[str]:
         """流式对话，逐段产出正文增量。
 
@@ -159,6 +169,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
+            system_suffix=system_suffix,
         )
         tool_slots: dict[int, dict] = {}
 

@@ -7,12 +7,15 @@ import logging
 
 import aiohttp
 
+from bot import __version__
 from bot.api import QQBotAPI
 from bot.gateway import GatewayClient
 from bot.handler import ChatHandler
 from bot.token import AccessTokenManager
 from config import Config
 from services.admins import AdminStore
+from services.asr import ASRClient
+from services.blocklist import BlockStore
 from services.context import ContextStore
 from services.deepseek import DeepSeekClient
 from services.preferences import PreferenceStore
@@ -51,6 +54,7 @@ async def run(config: Config) -> None:
         preferences = PreferenceStore(config.settings_file)
         reset_codes = ResetCodeStore(config.reset_code_file)
         admins = AdminStore(config.admin_file)
+        blocks = BlockStore(config.block_file)
         web = WebTools(
             session,
             search_count=config.web_search_count,
@@ -59,6 +63,7 @@ async def run(config: Config) -> None:
             fetch_max_bytes=config.web_fetch_max_bytes,
             render_mode=config.web_render_mode,
         )
+        asr = ASRClient(config, session)
 
         handler = ChatHandler(
             config,
@@ -71,10 +76,12 @@ async def run(config: Config) -> None:
             reset_codes,
             admins,
             web,
+            asr,
+            blocks,
         )
         gateway = GatewayClient(config, api, tokens, handler.handle)
 
-        logger.info("CXBot 启动，AppID=%s", config.app_id)
+        logger.info("CXBot v%s 启动，AppID=%s", __version__, config.app_id)
         try:
             await gateway.run()
         finally:

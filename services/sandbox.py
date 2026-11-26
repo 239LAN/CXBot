@@ -166,6 +166,20 @@ class CommandSandbox:
                 continue
             real = path.resolve() if path.is_symlink() else path
             args += ["--ro-bind", str(real), src]
+        if self._allow_network:
+            # /etc/resolv.conf 常是指向 /run/systemd/resolve/... 的软链接，
+            # 只挂 /etc 时目标不存在会导致沙箱内无法解析域名。复制一份真实内容覆盖挂载。
+            try:
+                resolv_content = Path("/etc/resolv.conf").read_bytes()
+            except OSError:
+                resolv_content = b""
+            if resolv_content:
+                resolv_file = cwd / ".tmp" / "resolv.conf"
+                try:
+                    resolv_file.write_bytes(resolv_content)
+                    args += ["--ro-bind", str(resolv_file), "/etc/resolv.conf"]
+                except OSError:
+                    logger.warning("沙箱 DNS 配置写入失败", exc_info=True)
         args += [
             "--proc",
             "/proc",

@@ -1,5 +1,7 @@
 aiohttp>=3.9,<4
 # PDF 文档文本提取
 pypdf>=4.2
+# 图片格式转换与压缩（大图、非标准图片转成模型可识别的 JPEG）
+Pillow>=10
 # 可选：网页抓取时等待 JS 加载完成（安装后还需执行 playwright install chromium）
 # playwright>=1.40

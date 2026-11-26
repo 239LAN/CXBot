@@ -107,6 +107,13 @@ class ResetCodeStore:
         self._lock = asyncio.Lock()
         self._data = _load(path)
 
+    async def generate(self, count: int = 1, expires_days: int = 30) -> list[str]:
+        """管理员在聊天中生成重置码，返回明文码（仅本次可见）。"""
+        async with self._lock:
+            codes = generate_codes(self._path, count, expires_days)
+            self._data = _load(self._path)
+            return codes
+
     async def redeem(self, code: str, scope: str) -> tuple[bool, str]:
         """核销重置码并绑定到当前会话，返回 (是否成功, 失败原因)。"""
         digest = _hash(code)

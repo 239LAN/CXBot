@@ -13,22 +13,53 @@ _MENTION_RE = re.compile(r"<@[!]?[^>]+>")
 
 
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-_MEDIA_PREFIXES = ("audio/", "video/")
+_AUDIO_SUFFIXES = (
+    ".amr",
+    ".silk",
+    ".slk",
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".flac",
+)
+_MEDIA_PREFIXES = ("video/",)
 
 
 def _is_image_attachment(item: dict) -> bool:
     content_type = str(item.get("content_type") or "").lower()
-    if content_type.startswith("image/"):
+    if content_type == "image" or content_type.startswith("image/"):
         return True
     filename = str(item.get("filename") or "").lower()
     return filename.endswith(_IMAGE_SUFFIXES)
 
 
+def _is_voice_attachment(item: dict) -> bool:
+    content_type = str(item.get("content_type") or "").lower()
+    if content_type == "voice" or content_type.startswith("audio/"):
+        return True
+    filename = str(item.get("filename") or "").lower()
+    return filename.endswith(_AUDIO_SUFFIXES)
+
+
 def _is_document_attachment(item: dict) -> bool:
-    if not item.get("url") or _is_image_attachment(item):
+    if not item.get("url"):
+        return False
+    if _is_image_attachment(item) or _is_voice_attachment(item):
         return False
     content_type = str(item.get("content_type") or "").lower()
     return not content_type.startswith(_MEDIA_PREFIXES)
+
+
+def attachment_kind(item: dict) -> str:
+    """返回附件类型，用于提示模型和展示。"""
+    if _is_image_attachment(item):
+        return "图片"
+    if _is_voice_attachment(item):
+        return "语音"
+    return "文件"
 
 
 @dataclass
@@ -57,6 +88,15 @@ class MessageEvent:
     @property
     def document_attachments(self) -> list[dict]:
         return [item for item in self.attachments if _is_document_attachment(item)]
+
+    @property
+    def voice_attachments(self) -> list[dict]:
+        return [
+            item
+            for item in self.attachments
+            if item.get("url") or item.get("voice_wav_url")
+            if _is_voice_attachment(item)
+        ]
 
 
 def _clean_content(content: str) -> str:

@@ -16,19 +16,30 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
+try:
+    from PIL import Image
+except ImportError:  # 未安装 Pillow 时不做压缩
+    Image = None
+
 from bot.api import QQBotAPI, QQBotAPIError
 from bot.commands import CommandRouter
-from bot.events import MessageEvent, split_text
+from bot.events import MessageEvent, attachment_kind, split_text
 from config import Config
 from services.admins import AdminStore
+from services.asr import ASRClient, ASRError
+from services.blocklist import BlockStore
 from services.context import ContextStore
+from services.continuation import ContinuationStore, split_at_limit
 from services.deepseek import DeepSeekClient, LLMError, StreamState
 from services.documents import DocumentError, extract_text
 from services.preferences import PreferenceStore
@@ -52,6 +63,17 @@ MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS_PER_ROUND = 8
 MAX_C2C_PASSIVE_REPLIES = 4  # 单聊同一条消息最多回复 4 次（含流式消息）
 DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 超过后走分片上传
+PENDING_UPLOAD_TTL = 600  # 只发附件后，等待提示词的最长时间（秒）
+MAX_PENDING_ATTACHMENTS = 10
+MAX_PROGRESS_CHARS = 400
+HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
+MAX_FULL_ANSWER_CHARS = 20000
+CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
+CONTINUE_CHARS = 1800
+PLAIN_TEXT_SUFFIX = (
+    "当前会话已关闭 Markdown 渲染，回复内容尽量不使用 Markdown 格式，"
+    "不要使用 # 标题、** 加粗、列表符号或表格，直接用纯文本自然表达。"
+)
 FALLBACK_REPLY = "抱歉，我这边暂时出了点问题，请稍后再试～"
 TRUNCATED_TOOL_RESULT = (
     "本次工具调用参数因输出达到长度上限被截断，未执行。"
@@ -59,12 +81,145 @@ TRUNCATED_TOOL_RESULT = (
 )
 
 
-def _image_mime(*candidates: str) -> str:
+@dataclass
+class PendingUploads:
+    """用户只发附件、还没发提示词时暂存的内容。"""
+
+    images: list[str] = field(default_factory=list)
+    document_blocks: list[str] = field(default_factory=list)
+    voice_texts: list[str] = field(default_factory=list)
+    attachments: list[dict] = field(default_factory=list)
+    updated_at: float = 0.0
+
+
+def _short(value: object, limit: int = 80) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _tool_arg(arguments: str, key: str) -> str:
+    try:
+        args = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(args, dict):
+        return ""
+    return str(args.get(key) or "").strip()
+
+
+@dataclass
+class ProgressTracker:
+    """汇总工具调用，用于流式过程展示。"""
+
+    reads: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    writes: list[str] = field(default_factory=list)
+    others: list[str] = field(default_factory=list)
+
+    def record(self, name: str, arguments: str) -> None:
+        path = _tool_arg(arguments, "path")
+        if name == "read_file":
+            self.reads.append(path or "文件")
+        elif name == "run_command":
+            self.commands.append(_tool_arg(arguments, "command") or "命令")
+        elif name in {
+            "write_file",
+            "append_file",
+            "edit_file",
+            "replace_lines",
+            "copy_file",
+            "move_file",
+            "delete_file",
+            "mkdir",
+        }:
+            self.writes.append(path or name)
+        elif name == "list_files":
+            self.others.append("查看了文件列表")
+        elif name == "workspace_usage":
+            self.others.append("查看了空间占用")
+        elif name == "web_search":
+            self.others.append("搜索了网页：" + _short(_tool_arg(arguments, "query"), 40))
+        elif name == "web_fetch":
+            self.others.append("抓取了网页：" + _short(_tool_arg(arguments, "url"), 60))
+        elif name == "save_attachment":
+            self.others.append("保存了附件")
+        elif name == "send_file":
+            self.others.append("发送了文件：" + _short(path, 40))
+        else:
+            self.others.append("调用了 " + name)
+
+    def render(self) -> str:
+        lines: list[str] = []
+        if self.reads:
+            lines.append(f"【阅读了{len(self.reads)}个文件】")
+            lines.extend(f"> {_short(item)}" for item in self.reads[-3:])
+        if self.commands:
+            lines.append(f"【执行了{len(self.commands)}条命令】")
+            lines.extend(f"> {_short(item)}" for item in self.commands[-3:])
+        if self.writes:
+            lines.append(f"【修改了{len(self.writes)}个文件】")
+        lines.extend(f"【{item}】" for item in self.others[-5:])
+        text = "\n".join(lines)
+        if len(text) > MAX_PROGRESS_CHARS:
+            text = text[: MAX_PROGRESS_CHARS - 1].rstrip() + "…"
+        return text
+
+
+def _sniff_image_mime(data: bytes, *candidates: str) -> str:
+    """优先按文件头判断图片类型，拿不准时返回空字符串而不是猜 jpeg。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
     for value in candidates:
-        mime = value.split(";")[0].strip().lower()
-        if mime.startswith("image/"):
+        mime = str(value or "").split(";")[0].strip().lower()
+        if mime in SUPPORTED_IMAGE_MIMES:
             return mime
-    return "image/jpeg"
+    return ""
+
+
+SUPPORTED_IMAGE_MIMES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+}
+IMAGE_SHRINK_BYTES = 1_200_000
+IMAGE_MAX_SIDE = 1600
+
+
+def _prepare_image(data: bytes, mime: str) -> tuple[bytes, str]:
+    """统一成模型支持的图片格式；体积过大时压缩成 JPEG。"""
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    small_enough = len(data) <= IMAGE_SHRINK_BYTES
+    if mime in SUPPORTED_IMAGE_MIMES and small_enough:
+        return data, mime
+    if Image is None:
+        return (data, mime) if mime in SUPPORTED_IMAGE_MIMES else (b"", "")
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            converted = img.convert("RGB")
+            converted.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
+            buffer = io.BytesIO()
+            converted.save(buffer, format="JPEG", quality=85, optimize=True)
+            result = buffer.getvalue()
+        if not result:
+            return b"", ""
+        if mime in SUPPORTED_IMAGE_MIMES and len(result) >= len(data):
+            return data, mime
+        return result, "image/jpeg"
+    except Exception:
+        logger.warning("图片转码失败，已跳过", exc_info=True)
+        return b"", ""
 
 SEND_FILE_SCHEMA = {
     "type": "function",
@@ -84,6 +239,33 @@ SEND_FILE_SCHEMA = {
     },
 }
 
+SAVE_ATTACHMENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "save_attachment",
+        "description": (
+            "把当前可处理附件（文档、图片、语音等，含刚上传的附件）下载到私有空间。"
+            "index 从 1 开始，对应提示中的【可处理附件】列表；"
+            "path 省略时使用原文件名，overwrite=true 可覆盖同名文件。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "附件序号，从 1 开始"},
+                "path": {
+                    "type": "string",
+                    "description": "保存到私有空间的相对路径，可省略",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "同名文件是否覆盖，默认 false",
+                },
+            },
+            "required": ["index"],
+        },
+    },
+}
+
 
 class ChatHandler:
     def __init__(
@@ -98,6 +280,8 @@ class ChatHandler:
         reset_codes: ResetCodeStore,
         admins: AdminStore,
         web: WebTools,
+        asr: ASRClient,
+        blocks: BlockStore | None = None,
     ) -> None:
         self._config = config
         self._api = api
@@ -109,10 +293,20 @@ class ChatHandler:
         self._reset_codes = reset_codes
         self._admins = admins
         self._web = web
+        self._asr = asr
+        self._blocks = blocks or BlockStore(config.block_file)
+        self._continuations = ContinuationStore()
         self._commands = CommandRouter(
-            config, quota, preferences, reset_codes, admins
+            config,
+            quota,
+            preferences,
+            reset_codes,
+            admins,
+            workspace,
+            self._blocks,
         )
         self._locks: dict[str, asyncio.Lock] = {}
+        self._pending_uploads: dict[str, PendingUploads] = {}
 
     def _lock_for(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -126,8 +320,33 @@ class ChatHandler:
         text = event.content
 
         async with self._lock_for(key):
+            if self._blocks.is_blocked(event.user_openid) and not self._admins.is_admin(
+                event.user_openid
+            ):
+                await self._reply(event, "你已被限制使用本服务。")
+                return
+
+            if text.lower() in ("/continue", "/继续"):
+                # 预留一条消息给“继续”提示，避免分条发送时提示被截断
+                chunk_limit = min(
+                    CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3)
+                )
+                item = self._continuations.take(key, chunk_limit)
+                if item is None:
+                    await self._reply(
+                        event, "没有需要继续的内容，或已超过 1 小时。"
+                    )
+                    return
+                chunk, rest = item
+                content = chunk + (CONTINUE_HINT if rest else "")
+                markdown_on = await self._preferences.get(key, "markdown") != "off"
+                await self._reply(event, content, markdown=markdown_on)
+                return
+
             if text.lower() in RESET_COMMANDS:
                 self._contexts.reset(key)
+                self._pending_uploads.pop(key, None)
+                self._continuations.clear(key)
                 logger.info("清空上下文：%s", key)
                 await self._reply(event, "上下文已清空，我们重新开始吧。")
                 return
@@ -137,9 +356,13 @@ class ChatHandler:
                 await self._reply(event, reply)
                 return
 
+            if not text and (event.image_attachments or event.document_attachments):
+                await self._handle_attachment_only(event, key)
+                return
+
             unlimited = self._admins.is_admin(event.user_openid)
             if unlimited:
-                remaining = self._max_output_tokens()
+                remaining = self._admin_output_tokens()
                 logger.info("管理员不限额度：%s", event.user_openid)
             else:
                 remaining, reason = await self._quota.check(key)
@@ -150,9 +373,21 @@ class ChatHandler:
 
             images = await self._load_images(event)
             doc_blocks, doc_errors = await self._load_documents(event)
+            voice_texts, voice_errors = await self._load_voices(event)
 
-            if not text and not images and not doc_blocks:
-                if event.document_attachments:
+            images, doc_blocks, voice_texts = self._merge_pending_uploads(
+                key, event, images, doc_blocks, voice_texts
+            )
+
+            if not text and not images and not doc_blocks and not voice_texts:
+                if event.voice_attachments:
+                    reason = (
+                        voice_errors[0]
+                        if voice_errors
+                        else "语音识别失败，请重试或直接发文字。"
+                    )
+                    await self._reply(event, reason)
+                elif event.document_attachments:
                     reason = doc_errors[0] if doc_errors else "未提取到文本"
                     await self._reply(event, f"文档解析失败：{reason}")
                 elif event.image_attachments:
@@ -171,21 +406,39 @@ class ChatHandler:
                 prompt_text = "请描述这张图片。"
             else:
                 prompt_text = ""
+            if voice_texts:
+                transcripts = "\n".join(f"[语音]{item}" for item in voice_texts)
+                prompt_text = (
+                    f"{prompt_text}\n\n{transcripts}" if prompt_text else transcripts
+                )
             if doc_blocks:
                 prompt_text = f"{prompt_text}\n\n" + "\n\n".join(doc_blocks)
+            attachment_note = self._attachment_note(event)
+            if attachment_note:
+                prompt_text = (
+                    f"{prompt_text}\n\n{attachment_note}"
+                    if prompt_text
+                    else attachment_note
+                )
 
-            messages = self._contexts.load(key) + [
+            messages = self._contexts.load(key, **self._context_load_args(unlimited)) + [
                 {"role": "user", "content": self._user_content(prompt_text, images)}
             ]
-            history_text = self._history_text(text, len(images), len(doc_blocks))
+            history_text = self._history_text(
+                text, len(images), len(doc_blocks), voice_texts
+            )
 
             thinking = await self._preferences.get(key, "thinking")
             thinking_enabled, reasoning_effort = self._thinking_params(thinking)
             stream_off = await self._preferences.get(key, "stream") == "off"
+            progress_enabled = await self._preferences.get(key, "progress") == "on"
+            markdown_on = await self._preferences.get(key, "markdown") != "off"
 
             if event.kind == "c2c":
                 c2c_tools = (
-                    self._workspace.schemas() + self._web.schemas() + [SEND_FILE_SCHEMA]
+                    self._workspace.schemas()
+                    + self._web.schemas()
+                    + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
                 )
                 if stream_off:
                     # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
@@ -200,6 +453,7 @@ class ChatHandler:
                         tools=c2c_tools,
                         reply_seq={"next": 1, "reserve": 1},
                         unlimited=unlimited,
+                        markdown=markdown_on,
                     )
                     return
                 try:
@@ -210,6 +464,8 @@ class ChatHandler:
                         thinking_enabled,
                         reasoning_effort,
                         unlimited=unlimited,
+                        progress_enabled=progress_enabled,
+                        markdown_enabled=markdown_on,
                     )
                 except QQBotAPIError:
                     logger.exception("流式回复不可用，回退普通消息")
@@ -224,13 +480,21 @@ class ChatHandler:
                         tools=c2c_tools,
                         reply_seq={"next": 1, "reserve": 1},
                         unlimited=unlimited,
+                        markdown=markdown_on,
                     )
                     return
                 if ok and answer:
-                    self._contexts.append_turn(key, history_text, answer)
+                    self._contexts.append_turn(
+                        key, history_text, answer, **self._context_load_args(unlimited)
+                    )
                 return
 
-            # 群聊不支持流式，走普通分条回复
+            # 群聊不支持流式，走普通分条回复；工作空间与沙箱按群共享
+            group_tools = (
+                self._workspace.schemas()
+                + self._web.schemas()
+                + [SAVE_ATTACHMENT_SCHEMA]
+            )
             await self._text_reply(
                 event,
                 messages,
@@ -239,7 +503,9 @@ class ChatHandler:
                 thinking_enabled,
                 reasoning_effort,
                 history_text,
+                tools=group_tools,
                 unlimited=unlimited,
+                markdown=markdown_on,
             )
 
     async def _download_attachment(
@@ -247,7 +513,11 @@ class ChatHandler:
     ) -> tuple[bytes, str] | None:
         try:
             timeout = aiohttp.ClientTimeout(total=ATTACHMENT_DOWNLOAD_TIMEOUT)
-            async with self._api.session.get(url, timeout=timeout) as resp:
+            # QQ 富媒体 CDN 对默认 UA 偶发 403，带上浏览器 UA 更稳
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; CXBot/1.0)"}
+            async with self._api.session.get(
+                url, timeout=timeout, headers=headers
+            ) as resp:
                 if resp.status != 200:
                     logger.warning("附件下载失败 HTTP %s：%s", resp.status, url)
                     return None
@@ -276,7 +546,13 @@ class ChatHandler:
             if downloaded is None:
                 continue
             data, content_type = downloaded
-            mime = _image_mime(str(item.get("content_type") or ""), content_type)
+            mime = _sniff_image_mime(
+                data, content_type, str(item.get("content_type") or "")
+            )
+            data, mime = await asyncio.to_thread(_prepare_image, data, mime)
+            if not mime or not data:
+                logger.warning("附件不是可识别的图片，已跳过：%s", url)
+                continue
             encoded = base64.b64encode(data).decode("ascii")
             images.append(f"data:{mime};base64,{encoded}")
         return images
@@ -331,6 +607,177 @@ class ChatHandler:
 
         return blocks, errors
 
+    async def _load_voices(
+        self, event: MessageEvent
+    ) -> tuple[list[str], list[str]]:
+        """优先使用 QQ 自带 ASR 文本，否则下载音频并调用语音识别。"""
+        attachments = event.voice_attachments[: self._config.voice_max_count]
+        texts: list[str] = []
+        errors: list[str] = []
+        remaining = self._config.asr_max_chars
+
+        for item in attachments:
+            refer = str(item.get("asr_refer_text") or "").strip()
+            if refer and self._config.use_qq_asr_refer:
+                text = refer
+            elif not self._asr.enabled:
+                if self._config.asr_enabled:
+                    errors.append("已收到语音，但未配置语音识别密钥，请直接发文字。")
+                else:
+                    errors.append("已收到语音，但第三方语音识别已关闭，请直接发文字。")
+                continue
+            else:
+                try:
+                    size = int(item.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                if size > self._config.voice_max_bytes:
+                    errors.append("语音文件过大，请缩短后重试")
+                    continue
+
+                urls: list[str] = []
+                for key in ("voice_wav_url", "url"):
+                    value = str(item.get(key) or "").strip()
+                    if value and value not in urls:
+                        urls.append(value)
+                if not urls:
+                    errors.append("语音下载地址为空")
+                    continue
+
+                text = ""
+                for url in urls:
+                    try:
+                        text = await self._asr.transcribe(url)
+                        break
+                    except ASRError as exc:
+                        logger.info("语音识别失败：%s", exc)
+                if not text:
+                    errors.append("语音识别失败，请重试或直接发文字。")
+                    continue
+
+            text = text.strip()
+            if not text:
+                errors.append("未识别到语音内容")
+                continue
+            if len(text) > remaining:
+                text = text[:remaining].rstrip() + "…"
+            texts.append(text)
+            remaining -= len(text)
+            if remaining <= 0:
+                break
+
+        return texts, errors
+
+    async def _handle_attachment_only(self, event: MessageEvent, key: str) -> None:
+        """只发文件/图片时先提示上传成功，内容暂存到下一次提示词。"""
+        count = len(event.image_attachments) + len(event.document_attachments)
+        await self._reply(
+            event, f"【{count}个文件上传成功，请继续上传或发送提示词】"
+        )
+
+        images = await self._load_images(event)
+        doc_blocks, _ = await self._load_documents(event)
+        voice_texts, _ = await self._load_voices(event)
+        self._add_pending_uploads(
+            key,
+            images=images,
+            document_blocks=doc_blocks,
+            voice_texts=voice_texts,
+            attachments=event.attachments,
+        )
+        logger.info("暂存附件：%s，%d 个", key, count)
+
+    def _add_pending_uploads(
+        self,
+        key: str,
+        *,
+        images: list[str],
+        document_blocks: list[str],
+        voice_texts: list[str],
+        attachments: list[dict],
+    ) -> None:
+        pending = self._pending_uploads.get(key)
+        if pending is None or time.monotonic() - pending.updated_at > PENDING_UPLOAD_TTL:
+            pending = PendingUploads()
+
+        pending.images = (pending.images + images)[-self._config.image_max_count :]
+        pending.document_blocks = (
+            pending.document_blocks + document_blocks
+        )[-self._config.document_max_count :]
+        pending.voice_texts = (
+            pending.voice_texts + voice_texts
+        )[-self._config.voice_max_count :]
+        pending.attachments = (
+            pending.attachments + attachments
+        )[-MAX_PENDING_ATTACHMENTS:]
+        pending.updated_at = time.monotonic()
+        self._pending_uploads[key] = pending
+
+    def _take_pending_uploads(self, key: str) -> PendingUploads | None:
+        pending = self._pending_uploads.pop(key, None)
+        if pending is None:
+            return None
+        if time.monotonic() - pending.updated_at > PENDING_UPLOAD_TTL:
+            return None
+        return pending
+
+    def _merge_pending_uploads(
+        self,
+        key: str,
+        event: MessageEvent,
+        images: list[str],
+        doc_blocks: list[str],
+        voice_texts: list[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        pending = self._take_pending_uploads(key)
+        if pending is None:
+            return images, doc_blocks, voice_texts
+
+        images = (pending.images + images)[-self._config.image_max_count :]
+        doc_blocks = self._limit_document_blocks(
+            (pending.document_blocks + doc_blocks)[
+                -self._config.document_max_count :
+            ],
+            self._config.document_max_chars,
+        )
+        voice_texts = (pending.voice_texts + voice_texts)[
+            -self._config.voice_max_count :
+        ]
+        event.attachments = pending.attachments + event.attachments
+        return images, doc_blocks, voice_texts
+
+    @staticmethod
+    def _limit_document_blocks(blocks: list[str], limit: int) -> list[str]:
+        result: list[str] = []
+        remaining = limit
+        for block in blocks:
+            if remaining <= 0:
+                break
+            if len(block) > remaining:
+                block = block[:remaining].rstrip() + "\n…（文档内容已截断）"
+            result.append(block)
+            remaining -= len(block)
+        return result
+
+    @staticmethod
+    def _attachment_note(event: MessageEvent) -> str:
+        if not event.attachments:
+            return ""
+        lines = ["【可处理附件】"]
+        for index, item in enumerate(event.attachments[:10], 1):
+            name = Path(str(item.get("filename") or "")).name
+            if not name:
+                name = f"attachment_{index}"
+            size = item.get("size")
+            try:
+                size_text = f"，{int(size)} 字节" if size is not None else ""
+            except (TypeError, ValueError):
+                size_text = ""
+            lines.append(f"{index}. {attachment_kind(item)}：{name}{size_text}")
+        if len(event.attachments) > 10:
+            lines.append("…（更多附件已省略）")
+        return "\n".join(lines)
+
     @staticmethod
     def _user_content(text: str, images: list[str]) -> str | list[dict]:
         if not images:
@@ -344,16 +791,25 @@ class ChatHandler:
         return parts
 
     @staticmethod
-    def _history_text(text: str, image_count: int, document_count: int = 0) -> str:
+    def _history_text(
+        text: str,
+        image_count: int,
+        document_count: int = 0,
+        voice_texts: list[str] | None = None,
+    ) -> str:
         notes: list[str] = []
         if image_count:
             notes.append(f"附图 {image_count} 张")
         if document_count:
             notes.append(f"附文档 {document_count} 个")
+        content = text
+        if voice_texts:
+            transcript = "\n".join(f"[语音]{item}" for item in voice_texts)
+            content = f"{content}\n{transcript}" if content else transcript
         if not notes:
-            return text
+            return content
         note = f"（{'，'.join(notes)}）"
-        return f"{text}{note}" if text else note
+        return f"{content}{note}" if content else note
 
     # ---------- 单聊：流式 + 工具 ----------
 
@@ -365,49 +821,76 @@ class ChatHandler:
         thinking_enabled: bool,
         reasoning_effort: str,
         unlimited: bool = False,
+        progress_enabled: bool = False,
+        markdown_enabled: bool = True,
     ) -> tuple[str, bool]:
-        """单聊流式回复，支持多轮工具调用。返回 (最终文本, 是否成功生成)。"""
+        """单聊流式回复，支持多轮工具调用、过程展示与断点续传。"""
         working = list(messages)
-        tools = self._workspace.schemas() + self._web.schemas() + [SEND_FILE_SCHEMA]
+        tools = (
+            self._workspace.schemas()
+            + self._web.schemas()
+            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+        )
         reply_seq = {"next": 2}  # 1 留给流式消息
+        content_type = "markdown" if markdown_enabled else "text"
+        system_suffix = "" if markdown_enabled else PLAIN_TEXT_SUFFIX
 
+        reserve = len(CONTINUE_HINT) + 8
+        if progress_enabled:
+            reserve += MAX_PROGRESS_CHARS
+        answer_limit = max(300, STREAM_MAX_CHARS - reserve)
+        progress = ProgressTracker() if progress_enabled else None
+
+        full_answer = ""
         answer = ""
         started = False
         stream_broken = False
         stream_msg_id = ""
         index = 0
         last_flush = 0.0
-        last_sent_len = 0
+        last_sent_answer_len = 0
+        last_sent_display = ""
         llm_failed = False
         rounds_exhausted = False
         output_cut = False
+        push_lock = asyncio.Lock()
 
-        async def push(content: str, final: bool = False) -> None:
-            nonlocal started, stream_msg_id, index, last_flush, last_sent_len
-            kwargs = {
-                "input_state": 10 if final else 1,
-                "index": index,
-                "msg_id": event.msg_id,
-            }
-            if stream_msg_id:
-                kwargs["stream_msg_id"] = stream_msg_id
-            resp = await self._api.stream_c2c_message(
-                event.user_openid, content, **kwargs
-            )
-            if not started:
-                stream_msg_id = str(resp.get("id") or "")
-                if not stream_msg_id:
-                    raise QQBotAPIError(
-                        200, None, "流式消息响应缺少 id", "stream_messages"
-                    )
-                started = True
-            index += 1
-            last_flush = time.monotonic()
-            last_sent_len = len(content)
+        def display_content() -> str:
+            note = progress.render() if progress else ""
+            if note and answer:
+                return f"{note}\n\n{answer}"
+            return note or answer
+
+        async def push(content: str) -> None:
+            nonlocal started, stream_msg_id, index, last_flush
+            async with push_lock:
+                kwargs = {
+                    "input_state": 1,
+                    "index": index,
+                    "msg_id": event.msg_id,
+                    "content_type": content_type,
+                }
+                if stream_msg_id:
+                    kwargs["stream_msg_id"] = stream_msg_id
+                resp = await self._api.stream_c2c_message(
+                    event.user_openid, content, **kwargs
+                )
+                if not started:
+                    stream_msg_id = str(resp.get("id") or "")
+                    if not stream_msg_id:
+                        raise QQBotAPIError(
+                            200, None, "流式消息响应缺少 id", "stream_messages"
+                        )
+                    started = True
+                index += 1
+                last_flush = time.monotonic()
 
         async def flush(force: bool = False) -> None:
-            nonlocal stream_broken
-            if not answer or stream_broken:
+            nonlocal stream_broken, last_sent_display, last_sent_answer_len
+            if stream_broken:
+                return
+            content = display_content()
+            if not content:
                 return
             now = time.monotonic()
             if not started or force:
@@ -415,17 +898,48 @@ class ChatHandler:
             else:
                 should_send = (
                     now - last_flush >= STREAM_FLUSH_INTERVAL
-                    and len(answer) > last_sent_len
+                    and content != last_sent_display
                 )
             if not should_send:
                 return
             try:
-                await push(answer)
+                await push(content)
+                last_sent_display = content
+                last_sent_answer_len = len(answer)
             except QQBotAPIError:
                 stream_broken = True
                 logger.exception("流式分片发送失败：%s", event.user_openid)
 
-        for _round in range(MAX_TOOL_ROUNDS + 1):
+        async def run_tool_with_heartbeat(coro) -> str:
+            task = asyncio.create_task(coro)
+            while True:
+                done, _ = await asyncio.wait(
+                    {task}, timeout=HEARTBEAT_INTERVAL
+                )
+                if done:
+                    return task.result()
+                # 工具执行期间重复发送当前内容，避免 QQ 流式连接超时
+                await keep_alive()
+
+        async def keep_alive() -> None:
+            nonlocal stream_broken
+            if stream_broken:
+                return
+            if not started:
+                try:
+                    await push("\u200b")
+                except QQBotAPIError:
+                    stream_broken = True
+                    logger.exception("流式消息建立失败：%s", event.user_openid)
+                    return
+            await flush(force=True)
+
+        # 先建立流式消息，避免模型思考期间连接空闲
+        await keep_alive()
+
+        round_limit = self._round_limit(unlimited)
+        _round = 0
+        while True:
             state = StreamState()
             round_text = ""
             try:
@@ -437,20 +951,20 @@ class ChatHandler:
                         max_tokens=remaining,
                         thinking_enabled=thinking_enabled,
                         reasoning_effort=reasoning_effort,
+                        system_suffix=system_suffix,
                     )
                 ) as stream:
                     async for delta in stream:
-                        # 超出展示上限后仍继续消费，确保拿到最终 usage 用于计费
-                        if len(answer) >= STREAM_MAX_CHARS:
-                            continue
-                        answer += delta
-                        round_text += delta
+                        if len(full_answer) < MAX_FULL_ANSWER_CHARS:
+                            full_answer += delta
+                        if len(round_text) < MAX_FULL_ANSWER_CHARS:
+                            round_text += delta
+                        if len(answer) < answer_limit:
+                            answer += delta[: answer_limit - len(answer)]
                         await flush()
             except LLMError:
                 llm_failed = True
                 logger.exception("流式生成失败：%s", event.user_openid)
-                if not answer:
-                    answer = FALLBACK_REPLY
                 break
 
             await self._charge_usage(
@@ -459,11 +973,11 @@ class ChatHandler:
             if state.finish_reason == "length" and not state.tool_calls:
                 output_cut = True
             if unlimited:
-                remaining = self._max_output_tokens()
+                remaining = self._admin_output_tokens()
             else:
                 remaining = await self._quota.remaining(event.context_key)
 
-            if len(answer) >= STREAM_MAX_CHARS:
+            if len(full_answer) >= MAX_FULL_ANSWER_CHARS:
                 break
             if not state.tool_calls:
                 break
@@ -474,6 +988,10 @@ class ChatHandler:
             calls = self._prepare_tool_calls(state, _round)
             if not calls:
                 logger.warning("模型返回了无效工具调用：%s", event.user_openid)
+                break
+            if round_limit is not None and _round >= round_limit:
+                rounds_exhausted = True
+                logger.warning("工具调用轮数超限：%s", event.user_openid)
                 break
             working.append(self._assistant_tool_message(round_text, state))
             if state.finish_reason == "length":
@@ -486,6 +1004,7 @@ class ChatHandler:
                             "content": TRUNCATED_TOOL_RESULT,
                         }
                     )
+                _round += 1
                 continue
 
             for call in calls:
@@ -493,7 +1012,12 @@ class ChatHandler:
                 arguments = call["function"]["arguments"]
                 tool_call_id = call["id"]
                 logger.info("调用工具 %s：%s", tool_name, arguments[:200])
-                result = await self._run_tool(event, tool_name, arguments, reply_seq)
+                if progress is not None:
+                    progress.record(tool_name, arguments)
+                    await flush(force=True)
+                result = await run_tool_with_heartbeat(
+                    self._run_tool(event, tool_name, arguments, reply_seq)
+                )
                 working.append(
                     {
                         "role": "tool",
@@ -501,41 +1025,60 @@ class ChatHandler:
                         "content": result,
                     }
                 )
-        else:
-            rounds_exhausted = True
-            logger.warning("工具调用轮数超限：%s", event.user_openid)
+            _round += 1
 
-        if output_cut and answer and not answer.endswith(
-            ("…", "。", "！", "？", "!", "?")
-        ):
-            answer += "…"
-        if len(answer) > STREAM_MAX_CHARS:
-            answer = answer[:STREAM_MAX_CHARS] + "…"
-        if not answer:
-            answer = FALLBACK_REPLY
+        if not full_answer:
+            full_answer = answer or FALLBACK_REPLY
+            if not answer:
+                llm_failed = True
+
+        first, rest = split_at_limit(full_answer, answer_limit)
+        if rest:
+            self._continuations.put(event.context_key, rest)
+            answer = first + CONTINUE_HINT
+        else:
+            answer = first
+            if output_cut and answer and not answer.endswith(
+                ("……", "。", "！", "？", "!", "?")
+            ):
+                answer += "……"
+
+        final_display = display_content()
+        if not final_display:
+            final_display = FALLBACK_REPLY
             llm_failed = True
 
         if started:
             try:
                 await self._api.stream_c2c_message(
                     event.user_openid,
-                    answer,
+                    final_display,
                     input_state=10,
                     index=index,
                     stream_msg_id=stream_msg_id,
                     msg_id=event.msg_id,
+                    content_type=content_type,
                 )
             except QQBotAPIError:
                 logger.exception("结束流式消息失败，回退普通消息：%s", event.user_openid)
-                tail = answer[last_sent_len:] if last_sent_len < len(answer) else ""
+                tail = (
+                    answer[last_sent_answer_len:]
+                    if last_sent_answer_len < len(answer)
+                    else ""
+                )
                 if tail:
-                    await self._reply(event, tail, start_seq=reply_seq["next"])
+                    await self._reply(
+                        event,
+                        tail,
+                        start_seq=reply_seq["next"],
+                        markdown=markdown_enabled,
+                    )
         else:
             # 没有成功创建过流式消息，用普通消息兜底
-            await self._reply(event, answer)
+            await self._reply(event, final_display, markdown=markdown_enabled)
 
         ok = not (llm_failed or rounds_exhausted)
-        return answer, ok
+        return full_answer, ok
 
     async def _run_tool(
         self,
@@ -546,13 +1089,77 @@ class ChatHandler:
     ) -> str:
         if tool_name in WEB_TOOL_NAMES:
             return await self._web.execute(tool_name, arguments)
-        if event.kind != "c2c":
-            return f"工具不可用：{tool_name}（群聊只支持网页搜索与抓取）"
         if tool_name == "send_file":
+            if event.kind != "c2c":
+                return "发送失败：群聊暂不支持发送空间文件"
             if reply_seq is None:
-                return "发送失败：群聊不支持发送文件"
+                return "发送失败：缺少回复序号"
             return await self._send_file(event, arguments, reply_seq)
-        return await self._workspace.execute(event.user_openid, tool_name, arguments)
+        if tool_name == "save_attachment":
+            return await self._save_attachment(event, arguments)
+        return await self._workspace.execute(
+            self._workspace_key(event),
+            tool_name,
+            arguments,
+            quota_bytes=self._workspace_quota(event),
+        )
+
+    @staticmethod
+    def _workspace_key(event: MessageEvent) -> str:
+        return event.context_key if event.kind == "group" else event.user_openid
+
+    def _workspace_quota(self, event: MessageEvent) -> int | None:
+        if event.kind == "c2c" and self._admins.is_admin(event.user_openid):
+            return self._config.workspace_admin_quota_bytes
+        return None
+
+    async def _save_attachment(self, event: MessageEvent, arguments: str) -> str:
+        """把当前消息中的附件下载并保存到私有空间。"""
+        try:
+            args = json.loads(arguments or "{}")
+            if not isinstance(args, dict):
+                return "工具执行失败：参数必须是 JSON 对象"
+            index = int(args.get("index") or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return "工具执行失败：index 必须是正整数"
+
+        if index < 1 or index > len(event.attachments):
+            return f"工具执行失败：index 必须在 1-{len(event.attachments)} 之间"
+
+        item = event.attachments[index - 1]
+        url = str(item.get("url") or item.get("voice_wav_url") or "").strip()
+        if not url:
+            return "工具执行失败：该附件没有下载地址"
+
+        max_bytes = max(
+            self._config.document_max_bytes,
+            self._config.image_max_bytes,
+            self._config.voice_max_bytes,
+        )
+        downloaded = await self._download_attachment(url, max_bytes)
+        if downloaded is None:
+            return "工具执行失败：附件下载失败或超过大小上限"
+        data, _ = downloaded
+
+        filename = Path(str(item.get("filename") or "")).name
+        if not filename:
+            suffix = Path(urlsplit(url).path).suffix or ".bin"
+            filename = f"attachment_{index}{suffix}"
+        path = str(args.get("path") or filename).strip() or filename
+        try:
+            saved_path, size = self._workspace.save_bytes(
+                self._workspace_key(event),
+                path,
+                data,
+                overwrite=bool(args.get("overwrite")),
+                quota_bytes=self._workspace_quota(event),
+            )
+        except ToolError as exc:
+            return f"工具执行失败：{exc}"
+        except Exception as exc:
+            logger.exception("保存附件失败")
+            return f"工具执行失败：{exc}"
+        return f"已保存到工作空间：{saved_path}（{size} 字节）"
 
     async def _send_file(
         self, event: MessageEvent, arguments: str, reply_seq: dict
@@ -708,11 +1315,20 @@ class ChatHandler:
             message["reasoning_content"] = state.reasoning_content
         return message
 
-    def _max_output_tokens(self) -> int:
-        return max(
-            self._config.deepseek_max_tokens,
-            self._config.deepseek_tool_max_tokens,
-        )
+    def _admin_output_tokens(self) -> int:
+        """管理员单次输出上限。"""
+        return self._config.admin_max_tokens
+
+    def _context_load_args(self, unlimited: bool) -> dict:
+        """管理员按 token 预算保留上下文，普通用户按轮数裁剪。"""
+        if unlimited:
+            return {"max_tokens": self._config.admin_context_tokens}
+        return {}
+
+    @staticmethod
+    def _round_limit(unlimited: bool) -> int | None:
+        """管理员工具轮次不限；普通用户受 MAX_TOOL_ROUNDS 限制。"""
+        return None if unlimited else MAX_TOOL_ROUNDS
 
     def _thinking_params(self, value: str | None) -> tuple[bool, str]:
         if not value:
@@ -738,13 +1354,17 @@ class ChatHandler:
         tools: list[dict] | None = None,
         reply_seq: dict | None = None,
         unlimited: bool = False,
+        markdown: bool = True,
     ) -> None:
         """群聊与流式兜底：非流式回复，支持网页搜索/抓取工具。"""
         working = list(messages)
         tool_schemas = self._web.schemas() if tools is None else tools
+        system_suffix = "" if markdown else PLAIN_TEXT_SUFFIX
         answer = ""
 
-        for _round in range(MAX_TOOL_ROUNDS + 1):
+        round_limit = self._round_limit(unlimited)
+        _round = 0
+        while True:
             state = StreamState()
             try:
                 answer, usage = await self._llm.chat(
@@ -754,10 +1374,11 @@ class ChatHandler:
                     max_tokens=max_tokens,
                     thinking_enabled=thinking_enabled,
                     reasoning_effort=reasoning_effort,
+                    system_suffix=system_suffix,
                 )
             except LLMError:
                 logger.exception("生成回复失败：%s", key)
-                await self._reply(event, FALLBACK_REPLY)
+                await self._reply(event, FALLBACK_REPLY, markdown=markdown)
                 return
 
             await self._charge_usage(key, usage, unlimited=unlimited)
@@ -769,7 +1390,7 @@ class ChatHandler:
                 break
 
             if unlimited:
-                max_tokens = self._max_output_tokens()
+                max_tokens = self._admin_output_tokens()
             else:
                 remaining = await self._quota.remaining(key)
                 if remaining <= 0:
@@ -780,6 +1401,9 @@ class ChatHandler:
             calls = self._prepare_tool_calls(state, _round)
             if not calls:
                 logger.warning("模型返回了无效工具调用：%s", key)
+                break
+            if round_limit is not None and _round >= round_limit:
+                logger.warning("工具调用轮数超限：%s", key)
                 break
             working.append(self._assistant_tool_message(answer, state))
             if state.finish_reason == "length":
@@ -792,6 +1416,7 @@ class ChatHandler:
                             "content": TRUNCATED_TOOL_RESULT,
                         }
                     )
+                _round += 1
                 continue
 
             for call in calls:
@@ -806,17 +1431,27 @@ class ChatHandler:
                         "content": result,
                     }
                 )
+            _round += 1
 
         if not answer:
             answer = FALLBACK_REPLY
-        self._contexts.append_turn(key, user_text, answer)
+        self._contexts.append_turn(
+            key, user_text, answer, **self._context_load_args(unlimited)
+        )
         await self._reply(
             event,
             answer,
             start_seq=reply_seq["next"] if reply_seq else 1,
+            markdown=markdown,
         )
 
-    async def _reply(self, event: MessageEvent, text: str, start_seq: int = 1) -> None:
+    async def _reply(
+        self,
+        event: MessageEvent,
+        text: str,
+        start_seq: int = 1,
+        markdown: bool = False,
+    ) -> None:
         if event.kind == "c2c":
             max_chunks = min(MAX_CHUNKS, MAX_C2C_PASSIVE_REPLIES - start_seq + 1)
             if max_chunks <= 0:
@@ -831,13 +1466,15 @@ class ChatHandler:
 
         for offset, chunk in enumerate(chunks):
             seq = start_seq + offset if event.kind == "c2c" else offset + 1
-            try:
+
+            async def send_chunk(use_markdown: bool) -> None:
                 if event.kind == "group":
                     await self._api.send_group_message(
                         event.group_openid or "",
                         chunk,
                         msg_id=event.msg_id,
                         msg_seq=seq,
+                        markdown=use_markdown,
                     )
                 else:
                     await self._api.send_c2c_message(
@@ -845,10 +1482,21 @@ class ChatHandler:
                         chunk,
                         msg_id=event.msg_id,
                         msg_seq=seq,
+                        markdown=use_markdown,
                     )
+
+            try:
+                await send_chunk(markdown)
             except QQBotAPIError:
-                logger.exception("发送回复失败：%s", event.msg_id)
-                return
+                if not markdown:
+                    logger.exception("发送回复失败：%s", event.msg_id)
+                    return
+                logger.warning("Markdown 发送失败，回退纯文本：%s", event.msg_id)
+                try:
+                    await send_chunk(False)
+                except QQBotAPIError:
+                    logger.exception("发送回复失败：%s", event.msg_id)
+                    return
 
             if offset < len(chunks) - 1:
                 await asyncio.sleep(CHUNK_INTERVAL)

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 
 from services.sandbox import CommandSandbox
@@ -24,7 +25,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "列出你在该用户私有空间中的文件（含子目录），只显示路径和大小。",
+            "description": "列出你在当前会话空间中的文件（含子目录），只显示路径和大小。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -34,6 +35,14 @@ TOOL_SCHEMAS: list[dict] = [
                     }
                 },
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_usage",
+            "description": "查看当前会话空间的占用情况：已用空间、上限、文件数量以及占用最大的文件。",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -217,7 +226,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "run_command",
             "description": (
-                "在用户私有空间内执行 shell 命令。命令的工作目录就是该用户的私有空间，"
+                "在当前会话空间内执行 shell 命令。命令的工作目录就是当前会话空间，"
                 "默认超时 10 秒，输出最多 8000 字符。运行环境为受限沙箱（Linux 优先使用 "
                 "bubblewrap，隔离进程；仅私有空间可写），网络是否可用由部署配置决定，"
                 "通常可以访问外网。适合运行脚本、处理文本、查看文件等；"
@@ -253,13 +262,32 @@ class WorkspaceTools:
         self._base = Path(base_dir)
         self._base.mkdir(parents=True, exist_ok=True)
         self._quota = max(1, quota_bytes)
+        self._quota_override: ContextVar[int | None] = ContextVar(
+            "workspace_quota_override", default=None
+        )
         self._sandbox = sandbox or CommandSandbox()
 
     def schemas(self) -> list[dict]:
         return TOOL_SCHEMAS
 
-    async def execute(self, user_openid: str, name: str, arguments: str) -> str:
+    async def execute(
+        self,
+        user_openid: str,
+        name: str,
+        arguments: str,
+        *,
+        quota_bytes: int | None = None,
+    ) -> str:
         """执行工具，返回给模型看的文本结果；异常不外抛。"""
+        token = self._quota_override.set(
+            max(1, quota_bytes) if quota_bytes else None
+        )
+        try:
+            return await self._execute(user_openid, name, arguments)
+        finally:
+            self._quota_override.reset(token)
+
+    async def _execute(self, user_openid: str, name: str, arguments: str) -> str:
         try:
             args = json.loads(arguments or "{}")
             if not isinstance(args, dict):
@@ -310,6 +338,36 @@ class WorkspaceTools:
             raise ToolError("文件超过 200MB，QQ 不支持发送")
         return target.name, target.read_bytes()
 
+    def save_bytes(
+        self,
+        user_openid: str,
+        path: str,
+        data: bytes,
+        overwrite: bool = False,
+        *,
+        quota_bytes: int | None = None,
+    ) -> tuple[str, int]:
+        """把二进制内容写入私有空间，返回 (相对路径, 字节数)。"""
+        root = self._root(user_openid)
+        target = self._resolve(root, path)
+        if target == root.resolve() or target.is_dir():
+            raise ToolError("路径必须是文件")
+        if target.exists() and not overwrite:
+            raise ToolError(f"目标已存在：{path}（可指定其他 path 或 overwrite=true）")
+
+        old_size = target.stat().st_size if target.exists() else 0
+        self._check_quota(root, len(data) - old_size, quota_bytes)
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return target.relative_to(root.resolve()).as_posix(), len(data)
+
+    def usage_text(
+        self, user_openid: str, *, quota_bytes: int | None = None
+    ) -> str:
+        """返回供用户查看的空间占用摘要。"""
+        return self._usage_text(self._root(user_openid), quota_bytes)
+
     def _resolve(self, root: Path, rel: str) -> Path:
         if not isinstance(rel, str):
             raise ToolError("path 必须是字符串")
@@ -328,19 +386,47 @@ class WorkspaceTools:
     def _used_bytes(self, root: Path) -> int:
         return sum(f.lstat().st_size for f in root.rglob("*") if f.is_file())
 
-    def _check_quota(self, root: Path, delta: int) -> None:
+    def _check_quota(self, root: Path, delta: int, quota: int | None = None) -> None:
         used = self._used_bytes(root)
-        if used + delta > self._quota:
+        limit = quota or self._quota_override.get() or self._quota
+        if used + delta > limit:
             raise ToolError(
                 f"空间不足：已用 {self._fmt_size(used)}，本次需要 {self._fmt_size(delta)}，"
-                f"上限 {self._fmt_size(self._quota)}"
+                f"上限 {self._fmt_size(limit)}"
             )
 
     @staticmethod
     def _fmt_size(size: int) -> str:
         if size >= MB:
             return f"{size / MB:.1f}MB"
-        return f"{size / 1024:.0f}KB"
+        if size >= 1024:
+            return f"{size / 1024:.0f}KB"
+        return f"{size} 字节"
+
+    def _usage_text(self, root: Path, quota: int | None = None) -> str:
+        files = [item for item in root.rglob("*") if item.is_file()]
+        used = sum(item.lstat().st_size for item in files)
+        limit = quota or self._quota_override.get() or self._quota
+        percent = used / limit * 100 if limit else 0
+        lines = [
+            f"已用 {self._fmt_size(used)} / {self._fmt_size(limit)}"
+            f"（{percent:.1f}%）",
+            f"文件数量：{len(files)} 个",
+        ]
+        if files:
+            largest = sorted(
+                files, key=lambda item: item.lstat().st_size, reverse=True
+            )[:5]
+            lines.append("占用最大的文件：")
+            for item in largest:
+                lines.append(
+                    f"- {item.relative_to(root).as_posix()}"
+                    f"（{self._fmt_size(item.stat().st_size)}）"
+                )
+        return "\n".join(lines)
+
+    def _tool_workspace_usage(self, root: Path) -> str:
+        return self._usage_text(root)
 
     def _tool_list_files(self, root: Path, path: str = "") -> str:
         target = self._resolve(root, path)
