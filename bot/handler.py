@@ -42,6 +42,7 @@ from services.context import ContextStore
 from services.continuation import ContinuationStore, split_at_limit
 from services.deepseek import DeepSeekClient, LLMError, StreamState
 from services.documents import DocumentError, extract_text
+from services.markdown import close_fences, split_markdown, split_markdown_chunks
 from services.preferences import PreferenceStore
 from services.quota import QuotaManager
 from services.reset_codes import ResetCodeStore
@@ -386,7 +387,8 @@ class ChatHandler:
             chunk_limit = min(
                 CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3)
             )
-            item = self._continuations.take(key, chunk_limit)
+            markdown_on = await self._preferences.get(key, "markdown") != "off"
+            item = self._continuations.take(key, chunk_limit, markdown=markdown_on)
             if item is None:
                 await self._reply(
                     event, "没有需要继续的内容，或已超过 1 小时。"
@@ -394,7 +396,6 @@ class ChatHandler:
                 return
             chunk, rest = item
             content = chunk + (CONTINUE_HINT if rest else "")
-            markdown_on = await self._preferences.get(key, "markdown") != "off"
             await self._reply(event, content, markdown=markdown_on)
             return
 
@@ -958,7 +959,7 @@ class ChatHandler:
             if thought:
                 blocks.append(thought)
             if answer:
-                blocks.append(answer)
+                blocks.append(close_fences(answer) if markdown_enabled else answer)
             return "\n\n".join(blocks)
 
         def reasoning_block() -> str:
@@ -1156,7 +1157,10 @@ class ChatHandler:
             if not answer:
                 llm_failed = True
 
-        first, rest = split_at_limit(full_answer, answer_limit)
+        if markdown_enabled:
+            first, rest = split_markdown(full_answer, answer_limit)
+        else:
+            first, rest = split_at_limit(full_answer, answer_limit)
         if rest:
             self._continuations.put(event.context_key, rest)
             answer = first + CONTINUE_HINT
@@ -1166,6 +1170,8 @@ class ChatHandler:
                 ("……", "。", "！", "？", "!", "?")
             ):
                 answer += "……"
+        if markdown_enabled:
+            answer = close_fences(answer)
 
         final_display = display_content()
         if not final_display:
@@ -1641,7 +1647,12 @@ class ChatHandler:
         else:
             max_chunks = MAX_CHUNKS
 
-        chunks = split_text(text, self._config.max_reply_chars, max_chunks)
+        if markdown:
+            chunks = split_markdown_chunks(
+                text, self._config.max_reply_chars, max_chunks
+            )
+        else:
+            chunks = split_text(text, self._config.max_reply_chars, max_chunks)
         if not chunks:
             return
 

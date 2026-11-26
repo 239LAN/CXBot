@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.4-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -23,6 +23,7 @@
 - 输出长度与上下文预算：`/length`、`/context` 按 token 设置，普通用户上限不超过管理员
 - 群聊设置权限：只有群主、群管理员或 Bot 管理员可以修改本群设置
 - 长回复截断续传：超出单条上限时先发 `……` 与 `发送[/继续]继续`，1 小时内可继续
+- Markdown 结构感知截断：切在代码块内会自动闭合并在续传时重开，表格续传会补表头，流式中间态同样闭合
 - 多模态输入：图片按文件头校正 MIME，大图自动压缩后传给 DeepSeek-Flash 原生视觉理解；文档自动提取文本（txt / md / csv / json / pdf / docx / xlsx / pptx）
 - 只发文件 / 图片时会先提示上传成功，10 分钟内的下一条提示词会合并处理这些附件
 - 语音消息：优先使用 QQ 自带识别文本，对模型只呈现为 `[语音]内容`；Fun-ASR 第三方识别保留但默认关闭（`ASR_ENABLED=on` 开启）

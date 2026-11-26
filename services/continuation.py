@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+from services.markdown import split_markdown
+
 CONTINUE_TTL = 3600.0  # 1 小时
 
 
@@ -37,7 +39,9 @@ class ContinuationStore:
             return
         self._items[key] = (text, time.monotonic())
 
-    def take(self, key: str, limit: int) -> tuple[str, str] | None:
+    def take(
+        self, key: str, limit: int, markdown: bool = True
+    ) -> tuple[str, str] | None:
         """取出下一段。返回 (本次内容, 剩余内容)；没有可续传内容时返回 None。"""
         item = self._items.get(key)
         if item is None:
@@ -47,7 +51,7 @@ class ContinuationStore:
             self._items.pop(key, None)
             return None
 
-        chunk, rest = split_at_limit(text, limit)
+        chunk, rest = split_markdown(text, limit) if markdown else split_at_limit(text, limit)
         if rest:
             self._items[key] = (rest, time.monotonic())
         else:
