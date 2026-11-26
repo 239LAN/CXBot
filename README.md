@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -13,7 +13,7 @@
 - 工具调用
   - 会话文件空间操作：列出、读取、写入、追加、替换、按行替换、删除、复制、重命名、建目录
   - 保存当前消息的附件（文档 / 图片 / 语音）到会话空间，查看空间占用
-  - 在会话空间内执行 shell 命令（Linux 默认 bubblewrap 沙箱，已修复 DNS 配置）
+  - 在会话空间内执行 shell 命令（Linux 默认 bubblewrap 沙箱，DNS 配置兼容 systemd-resolved 软链接）
   - 沙箱资源限制：单任务上限 0.1 核 / 256MB，全局 0.5 核 / 512MB；并发数自动推导，运行中均分资源
   - 把空间中的文件发送给用户，超过 5MB 自动分片上传
   - 必应网页搜索、网页抓取（优先 Playwright 等待 JS 加载，回退 curl）

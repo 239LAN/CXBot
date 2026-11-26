@@ -353,19 +353,7 @@ class CommandSandbox:
             real = path.resolve() if path.is_symlink() else path
             args += ["--ro-bind", str(real), src]
         if self._allow_network:
-            # /etc/resolv.conf 常是指向 /run/systemd/resolve/... 的软链接，
-            # 只挂 /etc 时目标不存在会导致沙箱内无法解析域名。复制一份真实内容覆盖挂载。
-            try:
-                resolv_content = Path("/etc/resolv.conf").read_bytes()
-            except OSError:
-                resolv_content = b""
-            if resolv_content:
-                resolv_file = cwd / ".tmp" / "resolv.conf"
-                try:
-                    resolv_file.write_bytes(resolv_content)
-                    args += ["--ro-bind", str(resolv_file), "/etc/resolv.conf"]
-                except OSError:
-                    logger.warning("沙箱 DNS 配置写入失败", exc_info=True)
+            args += self._dns_mounts(cwd)
         args += [
             "--proc",
             "/proc",
@@ -383,6 +371,58 @@ class CommandSandbox:
             "-c",
             command,
         ]
+        return args
+
+    def _dns_mounts(self, cwd: Path) -> list[str]:
+        """给沙箱注入可用的 resolv.conf。
+
+        /etc/resolv.conf 经常是指向 /run/systemd/resolve/... 的软链接，
+        只挂 /etc 时软链接目标不存在，直接 bind 到 /etc/resolv.conf 会因
+        跟随悬空软链接而报 No such file or directory。
+        这里把解析好的内容直接挂到软链接的真实目标路径。
+        """
+        source = Path("/etc/resolv.conf")
+        try:
+            content = source.read_bytes()
+        except OSError:
+            content = b""
+        # systemd-resolved 的 127.0.0.53 stub 在部分容器内不可用，
+        # 存在真实上游配置时优先使用（通常是运营商/公共 DNS）。
+        upstream = Path("/run/systemd/resolve/resolv.conf")
+        if upstream.is_file():
+            try:
+                upstream_content = upstream.read_bytes()
+            except OSError:
+                upstream_content = b""
+            if upstream_content.strip():
+                content = upstream_content
+        if not content.strip():
+            logger.warning("无法读取 /etc/resolv.conf，沙箱内可能无法解析域名")
+            return []
+
+        try:
+            # 不要求目标存在：软链接悬空时也能拿到真实路径，由 bwrap 负责创建
+            target = source.resolve()
+        except (OSError, RuntimeError):
+            target = source
+        if target == source and not source.exists():
+            logger.warning("找不到 /etc/resolv.conf，沙箱内可能无法解析域名")
+            return []
+
+        args: list[str] = []
+        resolve_dir = Path("/run/systemd/resolve")
+        if resolve_dir.is_dir():
+            # nss-resolve 可能依赖这里的 socket 与 stub 配置
+            args += ["--ro-bind", str(resolve_dir), str(resolve_dir)]
+
+        resolv_file = cwd / ".tmp" / "resolv.conf"
+        try:
+            resolv_file.write_bytes(content)
+        except OSError:
+            logger.warning("沙箱 DNS 配置写入失败", exc_info=True)
+            return args
+        # 挂到软链接的真实目标路径，避免 open("/etc/resolv.conf") 跟随悬空软链接
+        args += ["--ro-bind", str(resolv_file), str(target)]
         return args
 
     @staticmethod
