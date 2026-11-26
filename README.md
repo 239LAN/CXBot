@@ -59,10 +59,10 @@
 
 ### 一键安装（推荐）
 
-`dist/cxbot-install.sh` 是内嵌源码的单文件安装包，会创建虚拟环境、安装依赖、写入 systemd 服务并设置开机自启与崩溃重启：
+从 [Releases](https://github.com/239LAN/CXBot/releases/latest) 下载 `cxbot-<版本>-install.sh`，它是内嵌源码的单文件安装包，会创建虚拟环境、安装依赖、写入 systemd 服务并设置开机自启与崩溃重启：
 
 ```bash
-sudo bash dist/cxbot-install.sh
+sudo bash cxbot-1.1.0-install.sh
 ```
 
 安装后编辑 `/opt/cxbot/.env` 填写配置，再执行：
