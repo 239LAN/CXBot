@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
+import time
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -258,6 +260,7 @@ class WorkspaceTools:
         base_dir: Path,
         quota_bytes: int = 50 * MB,
         sandbox: CommandSandbox | None = None,
+        cleanup_days: int = 30,
     ) -> None:
         self._base = Path(base_dir)
         self._base.mkdir(parents=True, exist_ok=True)
@@ -266,6 +269,8 @@ class WorkspaceTools:
             "workspace_quota_override", default=None
         )
         self._sandbox = sandbox or CommandSandbox()
+        self._cleanup_days = max(1, cleanup_days)
+        self._access_file = self._base / "_access.json"
 
     def schemas(self) -> list[dict]:
         return TOOL_SCHEMAS
@@ -277,17 +282,27 @@ class WorkspaceTools:
         arguments: str,
         *,
         quota_bytes: int | None = None,
+        usage: dict | None = None,
     ) -> str:
-        """执行工具，返回给模型看的文本结果；异常不外抛。"""
+        """执行工具，返回给模型看的文本结果；异常不外抛。
+
+        usage 传入可变字典时，run_command 会写入执行时长与网络流量，供计费使用。
+        """
         token = self._quota_override.set(
             max(1, quota_bytes) if quota_bytes else None
         )
         try:
-            return await self._execute(user_openid, name, arguments)
+            return await self._execute(user_openid, name, arguments, usage)
         finally:
             self._quota_override.reset(token)
 
-    async def _execute(self, user_openid: str, name: str, arguments: str) -> str:
+    async def _execute(
+        self,
+        user_openid: str,
+        name: str,
+        arguments: str,
+        usage: dict | None = None,
+    ) -> str:
         try:
             args = json.loads(arguments or "{}")
             if not isinstance(args, dict):
@@ -296,17 +311,18 @@ class WorkspaceTools:
             root = self._root(user_openid)
             if name == "run_command":
                 result = await self._sandbox.run(
-                    root, args.get("command"), args.get("timeout")
+                    root, args.get("command"), args.get("timeout"), usage
                 )
+                text = result.output
             else:
                 tool = getattr(self, f"_tool_{name}", None)
                 if tool is None:
                     raise ToolError(f"未知工具：{name}")
-                result = await asyncio.to_thread(tool, root, **args)
+                text = await asyncio.to_thread(tool, root, **args)
 
-            if len(result) > MAX_TOOL_RESULT_CHARS:
-                result = result[:MAX_TOOL_RESULT_CHARS] + "\n…（结果已截断）"
-            return result
+            if len(text) > MAX_TOOL_RESULT_CHARS:
+                text = text[:MAX_TOOL_RESULT_CHARS] + "\n…（结果已截断）"
+            return text
         except json.JSONDecodeError as exc:
             logger.warning("工具参数 JSON 解析失败：%s（%s）", name, exc)
             return (
@@ -360,6 +376,7 @@ class WorkspaceTools:
 
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        self._touch(root, target)
         return target.relative_to(root.resolve()).as_posix(), len(data)
 
     def usage_text(
@@ -367,6 +384,95 @@ class WorkspaceTools:
     ) -> str:
         """返回供用户查看的空间占用摘要。"""
         return self._usage_text(self._root(user_openid), quota_bytes)
+
+    # ---------- 访问记录与自动清理 ----------
+
+    def _load_access(self) -> dict[str, float]:
+        try:
+            raw = json.loads(self._access_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, float] = {}
+        for key, value in raw.items():
+            try:
+                result[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _save_access(self, data: dict[str, float]) -> None:
+        try:
+            tmp = self._access_file.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            os.replace(tmp, self._access_file)
+        except OSError:
+            logger.warning("访问记录写入失败", exc_info=True)
+
+    def _touch(self, root: Path, target: Path) -> None:
+        """记录文件最近一次读取/写入时间。"""
+        try:
+            rel = target.resolve().relative_to(root.resolve()).as_posix()
+        except (ValueError, OSError):
+            return
+        data = self._load_access()
+        data[f"{root.name}/{rel}"] = time.time()
+        self._save_access(data)
+
+    def cleanup(
+        self, admin_ids: list[str] | None = None, now: float | None = None
+    ) -> int:
+        """删除超过 N 天未读取/写入的文件，管理员空间跳过。返回删除数量。"""
+        cutoff = (now if now is not None else time.time()) - (
+            self._cleanup_days * 86400
+        )
+        admin_roots = {
+            hashlib.sha256(str(item).encode("utf-8")).hexdigest()[:24]
+            for item in (admin_ids or [])
+        }
+        access = self._load_access()
+        kept: dict[str, float] = {}
+        deleted = 0
+
+        for root in self._base.iterdir():
+            if not root.is_dir() or root.name in admin_roots:
+                continue
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                key = f"{root.name}/{path.relative_to(root).as_posix()}"
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                last = max(access.get(key, 0.0), mtime)
+                if last < cutoff:
+                    try:
+                        path.unlink()
+                        deleted += 1
+                    except OSError:
+                        logger.warning("清理文件失败：%s", path, exc_info=True)
+                        kept[key] = last
+                else:
+                    kept[key] = last
+            for directory in sorted(
+                (item for item in root.rglob("*") if item.is_dir()),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                try:
+                    if not any(directory.iterdir()):
+                        directory.rmdir()
+                except OSError:
+                    pass
+
+        if deleted:
+            logger.info("工作空间清理完成，删除 %d 个文件", deleted)
+        self._save_access(kept)
+        return deleted
 
     def _resolve(self, root: Path, rel: str) -> Path:
         if not isinstance(rel, str):
@@ -458,6 +564,7 @@ class WorkspaceTools:
         target = self._resolve(root, path)
         if not target.is_file():
             raise ToolError(f"文件不存在：{path}")
+        self._touch(root, target)
 
         if start_line is None and end_line is None:
             raw = target.read_bytes()
@@ -538,6 +645,7 @@ class WorkspaceTools:
         self._check_quota(root, new_size - len(text.encode("utf-8")))
 
         target.write_text(updated, encoding="utf-8")
+        self._touch(root, target)
         return f"已替换第 {start}-{end} 行（{total} 行 → {len(updated_lines)} 行）"
 
     @staticmethod
@@ -567,6 +675,7 @@ class WorkspaceTools:
 
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        self._touch(root, target)
         return f"已写入 {path}（{new_size} 字节）"
 
     def _tool_append_file(self, root: Path, path: str, content: str) -> str:
@@ -582,6 +691,7 @@ class WorkspaceTools:
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as handle:
             handle.write(content)
+        self._touch(root, target)
         return f"已追加 {path}（新增 {added} 字节）"
 
     def _tool_edit_file(
@@ -614,6 +724,7 @@ class WorkspaceTools:
         self._check_quota(root, new_size - len(text.encode("utf-8")))
 
         target.write_text(updated, encoding="utf-8")
+        self._touch(root, target)
         return f"已修改 {path}（替换 {count if replace_all else 1} 处）"
 
     def _tool_delete_file(self, root: Path, path: str) -> str:

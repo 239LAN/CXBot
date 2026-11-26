@@ -138,7 +138,10 @@ class CommandRouter:
 
         if reason:
             lines.append(reason)
-        lines.append("计费：1 积分 = 1 输出 token = 4 输入 token；10 积分 = 1MB 文件。")
+        lines.append(
+            "计费：1 积分 = 1 输出 token = 4 输入 token；10 积分 = 1MB 文件；"
+            "沙箱 100 积分/秒；沙箱流量 1 积分/MB。"
+        )
         return "\n".join(lines)
 
     async def _workspace_reply(self, event: MessageEvent) -> str:

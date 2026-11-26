@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -14,6 +14,7 @@
   - 会话文件空间操作：列出、读取、写入、追加、替换、按行替换、删除、复制、重命名、建目录
   - 保存当前消息的附件（文档 / 图片 / 语音）到会话空间，查看空间占用
   - 在会话空间内执行 shell 命令（Linux 默认 bubblewrap 沙箱，已修复 DNS 配置）
+  - 沙箱资源限制：单任务 0.1 核 / 256MB，合计 0.5 核 / 512MB，支持多任务并行
   - 把空间中的文件发送给用户，超过 5MB 自动分片上传
   - 必应网页搜索、网页抓取（优先 Playwright 等待 JS 加载，回退 curl）
   - 群聊同样开放文件空间与沙箱命令，按群共享
@@ -22,7 +23,8 @@
 - 多模态输入：图片按文件头校正 MIME，大图自动压缩后传给 DeepSeek-Flash 原生视觉理解；文档自动提取文本（txt / md / csv / json / pdf / docx / xlsx / pptx）
 - 只发文件 / 图片时会先提示上传成功，10 分钟内的下一条提示词会合并处理这些附件
 - 语音消息：优先使用 QQ 自带识别文本，对模型只呈现为 `[语音]内容`；Fun-ASR 第三方识别保留但默认关闭（`ASR_ENABLED=on` 开启）
-- 积分额度：按真实 token 用量与发送文件大小计费，用户/群与全站分别限制日、周、月额度
+- 积分额度：按真实 token 用量、发送文件大小、沙箱执行时长（100 积分/秒）与沙箱双向流量（1 积分/MB）计费
+- 自动清理超过 30 天未读取 / 写入的文件（管理员空间不清理）
 - 管理员名单：不限额度、不计费、工具轮数不限，输出上限 393216 tokens，上下文预算 1048576 tokens，空间上限 1GB
 - 重置码：一次性恢复自己的额度；管理员可在聊天中生成
 - 黑名单：管理员可拉黑用户，禁止其继续使用
@@ -105,6 +107,12 @@ Python 3.10+。图片处理依赖 Pillow（大图与非常规格式会转成 JPE
 | `WORKSPACE_QUOTA_MB` | 每个会话（私聊用户 / 群）的文件空间上限，默认 50 |
 | `WORKSPACE_ADMIN_QUOTA_MB` | 管理员文件空间上限，默认 1024（1GB） |
 | `SANDBOX_NETWORK` | 沙箱命令是否允许联网，默认开启 |
+| `SANDBOX_CPU_PERCENT` | 单任务 CPU 配额（百分比），默认 10（0.1 核） |
+| `SANDBOX_MEMORY_MB` | 单任务内存上限，默认 256 |
+| `SANDBOX_MAX_PARALLEL` | 并行沙箱任务数，默认 2（256MB × 2 = 512MB） |
+| `WORKSPACE_CLEANUP_DAYS` | 未访问文件自动清理天数，默认 30 |
+| `QUOTA_CREDITS_PER_SECOND` | 沙箱每秒积分，默认 100 |
+| `QUOTA_CREDITS_PER_MB_NET` | 沙箱每 MB 流量积分（双向），默认 1 |
 | `QUOTA_USER_DAILY/WEEKLY/MONTHLY` | 用户/群额度，默认 80000 / 320000 / 800000 |
 | `QUOTA_GLOBAL_DAILY/WEEKLY/MONTHLY` | 全站额度，默认 500000 / 3000000 / 10000000 |
 | `ADMIN_FILE` | 管理员名单文件，默认 `data/admins.json` |

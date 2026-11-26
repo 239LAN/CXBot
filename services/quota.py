@@ -26,6 +26,8 @@ class QuotaManager:
     - 输入：1 积分 = N 个输入 token（默认 4）
     - 输出：1 积分 = 1 个输出 token
     - 文件：10 积分 = 1MB（默认）
+    - 沙箱命令：100 积分 / 秒（默认）
+    - 沙箱流量：1 积分 / 1MB（双向，默认）
     """
 
     def __init__(
@@ -40,6 +42,8 @@ class QuotaManager:
         global_monthly: int = 10000000,
         input_tokens_per_credit: int = 4,
         credits_per_mb: int = 10,
+        credits_per_second: int = 100,
+        credits_per_mb_network: int = 1,
     ) -> None:
         self._path = path
         self._user_limits = {
@@ -54,6 +58,8 @@ class QuotaManager:
         }
         self._input_tokens_per_credit = max(1, input_tokens_per_credit)
         self._credits_per_mb = max(0, credits_per_mb)
+        self._credits_per_second = max(0, credits_per_second)
+        self._credits_per_mb_network = max(0, credits_per_mb_network)
         self._lock = asyncio.Lock()
         self._data = self._load()
 
@@ -65,6 +71,8 @@ class QuotaManager:
         input_tokens: int = 0,
         output_tokens: int = 0,
         file_bytes: int = 0,
+        sandbox_seconds: float = 0.0,
+        network_bytes: int = 0,
     ) -> int:
         """按各维度向上取整计算积分。"""
         input_credits = math.ceil(
@@ -74,7 +82,19 @@ class QuotaManager:
         file_credits = math.ceil(
             max(0, file_bytes) * self._credits_per_mb / MB
         )
-        return input_credits + output_credits + file_credits
+        sandbox_credits = math.ceil(
+            max(0.0, sandbox_seconds) * self._credits_per_second
+        )
+        network_credits = math.ceil(
+            max(0, network_bytes) * self._credits_per_mb_network / MB
+        )
+        return (
+            input_credits
+            + output_credits
+            + file_credits
+            + sandbox_credits
+            + network_credits
+        )
 
     async def charge(
         self,
@@ -83,12 +103,16 @@ class QuotaManager:
         input_tokens: int = 0,
         output_tokens: int = 0,
         file_bytes: int = 0,
+        sandbox_seconds: float = 0.0,
+        network_bytes: int = 0,
     ) -> int:
         """按真实用量扣积分，同时计入用户/群与全站账户。返回本次积分。"""
         credits = self.cost(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             file_bytes=file_bytes,
+            sandbox_seconds=sandbox_seconds,
+            network_bytes=network_bytes,
         )
         if credits <= 0:
             return 0

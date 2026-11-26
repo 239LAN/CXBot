@@ -115,3 +115,8 @@ class AdminStore:
     def is_admin(self, identifier: str) -> bool:
         self._refresh()
         return normalize_identifier(identifier) in self._ids
+
+    def ids(self) -> list[str]:
+        """返回当前管理员标识列表（已刷新）。"""
+        self._refresh()
+        return sorted(self._ids)

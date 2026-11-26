@@ -79,8 +79,12 @@ class Config:
     workspace_dir: Path
     workspace_quota_bytes: int
     workspace_admin_quota_bytes: int
+    workspace_cleanup_days: int
     sandbox_mode: str
     sandbox_network: bool
+    sandbox_cpu_percent: int
+    sandbox_memory_bytes: int
+    sandbox_max_parallel: int
 
     quota_file: Path
     quota_user_daily: int
@@ -91,6 +95,8 @@ class Config:
     quota_global_monthly: int
     quota_input_tokens_per_credit: int
     quota_credits_per_mb: int
+    quota_credits_per_second: int
+    quota_credits_per_mb_network: int
     settings_file: Path
     reset_code_file: Path
     admin_file: Path
@@ -170,8 +176,16 @@ class Config:
             )
             * 1024
             * 1024,
+            workspace_cleanup_days=max(1, _get_int("WORKSPACE_CLEANUP_DAYS", 30)),
             sandbox_mode=_get("SANDBOX_MODE", "auto").lower(),
             sandbox_network=_get_bool("SANDBOX_NETWORK", True),
+            sandbox_cpu_percent=max(
+                1, min(100, _get_int("SANDBOX_CPU_PERCENT", 10))
+            ),
+            sandbox_memory_bytes=max(
+                32 * 1024 * 1024, _get_int("SANDBOX_MEMORY_MB", 256) * 1024 * 1024
+            ),
+            sandbox_max_parallel=max(1, _get_int("SANDBOX_MAX_PARALLEL", 2)),
             quota_file=Path(_get("QUOTA_FILE") or DATA_DIR / "quotas.json"),
             quota_user_daily=max(0, _get_int("QUOTA_USER_DAILY", 80000)),
             quota_user_weekly=max(0, _get_int("QUOTA_USER_WEEKLY", 320000)),
@@ -183,6 +197,12 @@ class Config:
                 1, _get_int("QUOTA_INPUT_TOKENS_PER_CREDIT", 4)
             ),
             quota_credits_per_mb=max(0, _get_int("QUOTA_CREDITS_PER_MB", 10)),
+            quota_credits_per_second=max(
+                0, _get_int("QUOTA_CREDITS_PER_SECOND", 100)
+            ),
+            quota_credits_per_mb_network=max(
+                0, _get_int("QUOTA_CREDITS_PER_MB_NET", 1)
+            ),
             settings_file=Path(_get("SETTINGS_FILE") or DATA_DIR / "settings.json"),
             reset_code_file=Path(
                 _get("RESET_CODE_FILE") or DATA_DIR / "reset_codes.json"

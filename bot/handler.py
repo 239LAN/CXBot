@@ -305,208 +305,201 @@ class ChatHandler:
             workspace,
             self._blocks,
         )
-        self._locks: dict[str, asyncio.Lock] = {}
         self._pending_uploads: dict[str, PendingUploads] = {}
-
-    def _lock_for(self, key: str) -> asyncio.Lock:
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[key] = lock
-        return lock
 
     async def handle(self, event: MessageEvent) -> None:
         key = event.context_key
         text = event.content
 
-        async with self._lock_for(key):
-            if self._blocks.is_blocked(event.user_openid) and not self._admins.is_admin(
-                event.user_openid
-            ):
-                await self._reply(event, "你已被限制使用本服务。")
-                return
+        # 不串行化整个处理流程：沙箱任务由自身并发槽位排队，
+        # 一个耗时任务不会阻塞其他消息的回复。
+        if self._blocks.is_blocked(event.user_openid) and not self._admins.is_admin(
+            event.user_openid
+        ):
+            await self._reply(event, "你已被限制使用本服务。")
+            return
 
-            if text.lower() in ("/continue", "/继续"):
-                # 预留一条消息给“继续”提示，避免分条发送时提示被截断
-                chunk_limit = min(
-                    CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3)
-                )
-                item = self._continuations.take(key, chunk_limit)
-                if item is None:
-                    await self._reply(
-                        event, "没有需要继续的内容，或已超过 1 小时。"
-                    )
-                    return
-                chunk, rest = item
-                content = chunk + (CONTINUE_HINT if rest else "")
-                markdown_on = await self._preferences.get(key, "markdown") != "off"
-                await self._reply(event, content, markdown=markdown_on)
-                return
-
-            if text.lower() in RESET_COMMANDS:
-                self._contexts.reset(key)
-                self._pending_uploads.pop(key, None)
-                self._continuations.clear(key)
-                logger.info("清空上下文：%s", key)
-                await self._reply(event, "上下文已清空，我们重新开始吧。")
-                return
-
-            if text.startswith("/"):
-                reply = await self._commands.route(event, text)
-                await self._reply(event, reply)
-                return
-
-            if not text and (event.image_attachments or event.document_attachments):
-                await self._handle_attachment_only(event, key)
-                return
-
-            unlimited = self._admins.is_admin(event.user_openid)
-            if unlimited:
-                remaining = self._admin_output_tokens()
-                logger.info("管理员不限额度：%s", event.user_openid)
-            else:
-                remaining, reason = await self._quota.check(key)
-                if reason:
-                    logger.info("额度不足，拒绝请求 %s：%s", key, reason)
-                    await self._reply(event, reason)
-                    return
-
-            images = await self._load_images(event)
-            doc_blocks, doc_errors = await self._load_documents(event)
-            voice_texts, voice_errors = await self._load_voices(event)
-
-            images, doc_blocks, voice_texts = self._merge_pending_uploads(
-                key, event, images, doc_blocks, voice_texts
+        if text.lower() in ("/continue", "/继续"):
+            # 预留一条消息给“继续”提示，避免分条发送时提示被截断
+            chunk_limit = min(
+                CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3)
             )
-
-            if not text and not images and not doc_blocks and not voice_texts:
-                if event.voice_attachments:
-                    reason = (
-                        voice_errors[0]
-                        if voice_errors
-                        else "语音识别失败，请重试或直接发文字。"
-                    )
-                    await self._reply(event, reason)
-                elif event.document_attachments:
-                    reason = doc_errors[0] if doc_errors else "未提取到文本"
-                    await self._reply(event, f"文档解析失败：{reason}")
-                elif event.image_attachments:
-                    await self._reply(event, "图片接收失败，请重新发送。")
-                else:
-                    await self._reply(event, "消息为空。")
+            item = self._continuations.take(key, chunk_limit)
+            if item is None:
+                await self._reply(
+                    event, "没有需要继续的内容，或已超过 1 小时。"
+                )
                 return
-
-            if text:
-                prompt_text = text
-            elif doc_blocks and images:
-                prompt_text = "请阅读我发送的文档和图片。"
-            elif doc_blocks:
-                prompt_text = "请阅读并总结我发送的文档。"
-            elif images:
-                prompt_text = "请描述这张图片。"
-            else:
-                prompt_text = ""
-            if voice_texts:
-                transcripts = "\n".join(f"[语音]{item}" for item in voice_texts)
-                prompt_text = (
-                    f"{prompt_text}\n\n{transcripts}" if prompt_text else transcripts
-                )
-            if doc_blocks:
-                prompt_text = f"{prompt_text}\n\n" + "\n\n".join(doc_blocks)
-            attachment_note = self._attachment_note(event)
-            if attachment_note:
-                prompt_text = (
-                    f"{prompt_text}\n\n{attachment_note}"
-                    if prompt_text
-                    else attachment_note
-                )
-
-            messages = self._contexts.load(key, **self._context_load_args(unlimited)) + [
-                {"role": "user", "content": self._user_content(prompt_text, images)}
-            ]
-            history_text = self._history_text(
-                text, len(images), len(doc_blocks), voice_texts
-            )
-
-            thinking = await self._preferences.get(key, "thinking")
-            thinking_enabled, reasoning_effort = self._thinking_params(thinking)
-            stream_off = await self._preferences.get(key, "stream") == "off"
-            progress_enabled = await self._preferences.get(key, "progress") == "on"
+            chunk, rest = item
+            content = chunk + (CONTINUE_HINT if rest else "")
             markdown_on = await self._preferences.get(key, "markdown") != "off"
+            await self._reply(event, content, markdown=markdown_on)
+            return
 
-            if event.kind == "c2c":
-                c2c_tools = (
-                    self._workspace.schemas()
-                    + self._web.schemas()
-                    + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-                )
-                if stream_off:
-                    # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
-                    await self._text_reply(
-                        event,
-                        messages,
-                        key,
-                        remaining,
-                        thinking_enabled,
-                        reasoning_effort,
-                        history_text,
-                        tools=c2c_tools,
-                        reply_seq={"next": 1, "reserve": 1},
-                        unlimited=unlimited,
-                        markdown=markdown_on,
-                    )
-                    return
-                try:
-                    answer, ok = await self._stream_reply(
-                        event,
-                        messages,
-                        remaining,
-                        thinking_enabled,
-                        reasoning_effort,
-                        unlimited=unlimited,
-                        progress_enabled=progress_enabled,
-                        markdown_enabled=markdown_on,
-                    )
-                except QQBotAPIError:
-                    logger.exception("流式回复不可用，回退普通消息")
-                    await self._text_reply(
-                        event,
-                        messages,
-                        key,
-                        remaining,
-                        thinking_enabled,
-                        reasoning_effort,
-                        history_text,
-                        tools=c2c_tools,
-                        reply_seq={"next": 1, "reserve": 1},
-                        unlimited=unlimited,
-                        markdown=markdown_on,
-                    )
-                    return
-                if ok and answer:
-                    self._contexts.append_turn(
-                        key, history_text, answer, **self._context_load_args(unlimited)
-                    )
+        if text.lower() in RESET_COMMANDS:
+            self._contexts.reset(key)
+            self._pending_uploads.pop(key, None)
+            self._continuations.clear(key)
+            logger.info("清空上下文：%s", key)
+            await self._reply(event, "上下文已清空，我们重新开始吧。")
+            return
+
+        if text.startswith("/"):
+            reply = await self._commands.route(event, text)
+            await self._reply(event, reply)
+            return
+
+        if not text and (event.image_attachments or event.document_attachments):
+            await self._handle_attachment_only(event, key)
+            return
+
+        unlimited = self._admins.is_admin(event.user_openid)
+        if unlimited:
+            remaining = self._admin_output_tokens()
+            logger.info("管理员不限额度：%s", event.user_openid)
+        else:
+            remaining, reason = await self._quota.check(key)
+            if reason:
+                logger.info("额度不足，拒绝请求 %s：%s", key, reason)
+                await self._reply(event, reason)
                 return
 
-            # 群聊不支持流式，走普通分条回复；工作空间与沙箱按群共享
-            group_tools = (
+        images = await self._load_images(event)
+        doc_blocks, doc_errors = await self._load_documents(event)
+        voice_texts, voice_errors = await self._load_voices(event)
+
+        images, doc_blocks, voice_texts = self._merge_pending_uploads(
+            key, event, images, doc_blocks, voice_texts
+        )
+
+        if not text and not images and not doc_blocks and not voice_texts:
+            if event.voice_attachments:
+                reason = (
+                    voice_errors[0]
+                    if voice_errors
+                    else "语音识别失败，请重试或直接发文字。"
+                )
+                await self._reply(event, reason)
+            elif event.document_attachments:
+                reason = doc_errors[0] if doc_errors else "未提取到文本"
+                await self._reply(event, f"文档解析失败：{reason}")
+            elif event.image_attachments:
+                await self._reply(event, "图片接收失败，请重新发送。")
+            else:
+                await self._reply(event, "消息为空。")
+            return
+
+        if text:
+            prompt_text = text
+        elif doc_blocks and images:
+            prompt_text = "请阅读我发送的文档和图片。"
+        elif doc_blocks:
+            prompt_text = "请阅读并总结我发送的文档。"
+        elif images:
+            prompt_text = "请描述这张图片。"
+        else:
+            prompt_text = ""
+        if voice_texts:
+            transcripts = "\n".join(f"[语音]{item}" for item in voice_texts)
+            prompt_text = (
+                f"{prompt_text}\n\n{transcripts}" if prompt_text else transcripts
+            )
+        if doc_blocks:
+            prompt_text = f"{prompt_text}\n\n" + "\n\n".join(doc_blocks)
+        attachment_note = self._attachment_note(event)
+        if attachment_note:
+            prompt_text = (
+                f"{prompt_text}\n\n{attachment_note}"
+                if prompt_text
+                else attachment_note
+            )
+
+        messages = self._contexts.load(key, **self._context_load_args(unlimited)) + [
+            {"role": "user", "content": self._user_content(prompt_text, images)}
+        ]
+        history_text = self._history_text(
+            text, len(images), len(doc_blocks), voice_texts
+        )
+
+        thinking = await self._preferences.get(key, "thinking")
+        thinking_enabled, reasoning_effort = self._thinking_params(thinking)
+        stream_off = await self._preferences.get(key, "stream") == "off"
+        progress_enabled = await self._preferences.get(key, "progress") == "on"
+        markdown_on = await self._preferences.get(key, "markdown") != "off"
+
+        if event.kind == "c2c":
+            c2c_tools = (
                 self._workspace.schemas()
                 + self._web.schemas()
-                + [SAVE_ATTACHMENT_SCHEMA]
+                + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
             )
-            await self._text_reply(
-                event,
-                messages,
-                key,
-                remaining,
-                thinking_enabled,
-                reasoning_effort,
-                history_text,
-                tools=group_tools,
-                unlimited=unlimited,
-                markdown=markdown_on,
-            )
+            if stream_off:
+                # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
+                await self._text_reply(
+                    event,
+                    messages,
+                    key,
+                    remaining,
+                    thinking_enabled,
+                    reasoning_effort,
+                    history_text,
+                    tools=c2c_tools,
+                    reply_seq={"next": 1, "reserve": 1},
+                    unlimited=unlimited,
+                    markdown=markdown_on,
+                )
+                return
+            try:
+                answer, ok = await self._stream_reply(
+                    event,
+                    messages,
+                    remaining,
+                    thinking_enabled,
+                    reasoning_effort,
+                    unlimited=unlimited,
+                    progress_enabled=progress_enabled,
+                    markdown_enabled=markdown_on,
+                )
+            except QQBotAPIError:
+                logger.exception("流式回复不可用，回退普通消息")
+                await self._text_reply(
+                    event,
+                    messages,
+                    key,
+                    remaining,
+                    thinking_enabled,
+                    reasoning_effort,
+                    history_text,
+                    tools=c2c_tools,
+                    reply_seq={"next": 1, "reserve": 1},
+                    unlimited=unlimited,
+                    markdown=markdown_on,
+                )
+                return
+            if ok and answer:
+                self._contexts.append_turn(
+                    key, history_text, answer, **self._context_load_args(unlimited)
+                )
+            return
+
+        # 群聊不支持流式，走普通分条回复；工作空间与沙箱按群共享
+        group_tools = (
+            self._workspace.schemas()
+            + self._web.schemas()
+            + [SAVE_ATTACHMENT_SCHEMA]
+        )
+        await self._text_reply(
+            event,
+            messages,
+            key,
+            remaining,
+            thinking_enabled,
+            reasoning_effort,
+            history_text,
+            tools=group_tools,
+            unlimited=unlimited,
+            markdown=markdown_on,
+        )
 
     async def _download_attachment(
         self, url: str, max_bytes: int
@@ -1016,7 +1009,9 @@ class ChatHandler:
                     progress.record(tool_name, arguments)
                     await flush(force=True)
                 result = await run_tool_with_heartbeat(
-                    self._run_tool(event, tool_name, arguments, reply_seq)
+                    self._run_tool(
+                        event, tool_name, arguments, reply_seq, unlimited=unlimited
+                    )
                 )
                 working.append(
                     {
@@ -1086,6 +1081,7 @@ class ChatHandler:
         tool_name: str,
         arguments: str,
         reply_seq: dict | None,
+        unlimited: bool = False,
     ) -> str:
         if tool_name in WEB_TOOL_NAMES:
             return await self._web.execute(tool_name, arguments)
@@ -1097,12 +1093,29 @@ class ChatHandler:
             return await self._send_file(event, arguments, reply_seq)
         if tool_name == "save_attachment":
             return await self._save_attachment(event, arguments)
-        return await self._workspace.execute(
+
+        usage: dict = {}
+        result = await self._workspace.execute(
             self._workspace_key(event),
             tool_name,
             arguments,
             quota_bytes=self._workspace_quota(event),
+            usage=usage,
         )
+        if usage and not unlimited:
+            seconds = float(usage.get("sandbox_seconds") or 0.0)
+            network = int(usage.get("network_bytes") or 0)
+            if seconds or network:
+                credits = await self._quota.charge(
+                    event.context_key,
+                    sandbox_seconds=seconds,
+                    network_bytes=network,
+                )
+                detail = f"{seconds:.2f} 秒"
+                if network:
+                    detail += f"、网络 {network / (1024 * 1024):.2f}MB"
+                result += f"\n（本次执行 {detail}，消耗 {credits} 积分）"
+        return result
 
     @staticmethod
     def _workspace_key(event: MessageEvent) -> str:
@@ -1423,7 +1436,9 @@ class ChatHandler:
                 tool_name = call["function"]["name"]
                 arguments = call["function"]["arguments"]
                 logger.info("调用工具 %s：%s", tool_name, arguments[:200])
-                result = await self._run_tool(event, tool_name, arguments, reply_seq)
+                result = await self._run_tool(
+                    event, tool_name, arguments, reply_seq, unlimited=unlimited
+                )
                 working.append(
                     {
                         "role": "tool",

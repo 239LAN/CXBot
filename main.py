@@ -37,7 +37,14 @@ async def run(config: Config) -> None:
         workspace = WorkspaceTools(
             config.workspace_dir,
             config.workspace_quota_bytes,
-            CommandSandbox(config.sandbox_mode, allow_network=config.sandbox_network),
+            CommandSandbox(
+                config.sandbox_mode,
+                allow_network=config.sandbox_network,
+                cpu_percent=config.sandbox_cpu_percent,
+                memory_bytes=config.sandbox_memory_bytes,
+                max_parallel=config.sandbox_max_parallel,
+            ),
+            cleanup_days=config.workspace_cleanup_days,
         )
         quota = QuotaManager(
             config.quota_file,
@@ -49,6 +56,8 @@ async def run(config: Config) -> None:
             global_monthly=config.quota_global_monthly,
             input_tokens_per_credit=config.quota_input_tokens_per_credit,
             credits_per_mb=config.quota_credits_per_mb,
+            credits_per_second=config.quota_credits_per_second,
+            credits_per_mb_network=config.quota_credits_per_mb_network,
         )
 
         preferences = PreferenceStore(config.settings_file)
@@ -81,11 +90,28 @@ async def run(config: Config) -> None:
         )
         gateway = GatewayClient(config, api, tokens, handler.handle)
 
+        cleanup_task = asyncio.create_task(_cleanup_loop(workspace, admins))
+
         logger.info("CXBot v%s 启动，AppID=%s", __version__, config.app_id)
         try:
             await gateway.run()
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
             gateway.stop()
+
+
+async def _cleanup_loop(workspace: WorkspaceTools, admins: AdminStore) -> None:
+    """定期清理长期未访问的工作空间文件（管理员空间跳过）。"""
+    while True:
+        try:
+            await asyncio.to_thread(workspace.cleanup, admins.ids())
+        except Exception:
+            logger.exception("工作空间自动清理失败")
+        await asyncio.sleep(6 * 3600)
 
 
 def main() -> None:
