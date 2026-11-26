@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -14,11 +14,14 @@
   - 会话文件空间操作：列出、读取、写入、追加、替换、按行替换、删除、复制、重命名、建目录
   - 保存当前消息的附件（文档 / 图片 / 语音）到会话空间，查看空间占用
   - 在会话空间内执行 shell 命令（Linux 默认 bubblewrap 沙箱，已修复 DNS 配置）
-  - 沙箱资源限制：单任务 0.1 核 / 256MB，合计 0.5 核 / 512MB，支持多任务并行
+  - 沙箱资源限制：单任务上限 0.1 核 / 256MB，全局 0.5 核 / 512MB；并发数自动推导，运行中均分资源
   - 把空间中的文件发送给用户，超过 5MB 自动分片上传
   - 必应网页搜索、网页抓取（优先 Playwright 等待 JS 加载，回退 curl）
   - 群聊同样开放文件空间与沙箱命令，按群共享
-- 流式过程显示（默认关闭，`/progress on` 开启）：【阅读了 x 个文件】【执行了 1 条命令】等
+- 流式过程显示：三档可调（不显示 / 命令与工具调用 / 含输出与结果），默认不显示，`/progress` 切换
+- 思考内容显示：可开关，开启后在流式回复中展示最近一段思考内容，`/thinking show on|off`
+- 输出长度与上下文预算：`/length`、`/context` 按 token 设置，普通用户上限不超过管理员
+- 群聊设置权限：只有群主、群管理员或 Bot 管理员可以修改本群设置
 - 长回复截断续传：超出单条上限时先发 `……` 与 `发送[/继续]继续`，1 小时内可继续
 - 多模态输入：图片按文件头校正 MIME，大图自动压缩后传给 DeepSeek-Flash 原生视觉理解；文档自动提取文本（txt / md / csv / json / pdf / docx / xlsx / pptx）
 - 只发文件 / 图片时会先提示上传成功，10 分钟内的下一条提示词会合并处理这些附件
@@ -35,18 +38,23 @@
 | 指令 | 说明 |
 | --- | --- |
 | `/help` | 查看帮助 |
-| `/about` | 查看版本信息 |
+| `/about` | 查看版本、开源协议与当前设置 |
 | `/reset` | 清空当前对话上下文 |
 | `/continue` | 继续发送被截断的内容（1 小时内有效） |
 | `/quota` | 查看剩余额度 |
 | `/quota detail` | 查看各周期已用 / 上限 |
 | `/workspace` | 查看会话空间占用（私聊 / 群聊） |
-| `/progress` | 查看过程显示状态 |
-| `/progress on\|off\|default` | 开 / 关工具过程记录（仅私聊流式） |
+| `/progress` | 查看过程显示档位 |
+| `/progress off\|calls\|full\|default` | 不显示 / 命令与工具调用 / 含输出与结果 |
+| `/length` | 查看单次输出上限 |
+| `/length <tokens>\|default` | 设置输出上限（不超过管理员上限） |
+| `/context` | 查看上下文预算 |
+| `/context <tokens>\|default` | 设置上下文 token 上限（不超过管理员上限） |
 | `/markdown` | 查看 Markdown 渲染状态 |
 | `/markdown on\|off\|default` | 开 / 关 Markdown 渲染 |
-| `/thinking` | 查看思考强度 |
+| `/thinking` | 查看思考强度与思考显示 |
 | `/thinking off\|low\|medium\|high\|max\|default` | 调整思考强度 |
+| `/thinking show on\|off\|default` | 开 / 关思考内容显示（仅私聊流式） |
 | `/stream` | 查看流式输出状态 |
 | `/stream on\|off\|default` | 开 / 关流式输出（仅私聊） |
 | `/motd <地址>` | 探测 Minecraft Java 服务器 |
@@ -107,9 +115,11 @@ Python 3.10+。图片处理依赖 Pillow（大图与非常规格式会转成 JPE
 | `WORKSPACE_QUOTA_MB` | 每个会话（私聊用户 / 群）的文件空间上限，默认 50 |
 | `WORKSPACE_ADMIN_QUOTA_MB` | 管理员文件空间上限，默认 1024（1GB） |
 | `SANDBOX_NETWORK` | 沙箱命令是否允许联网，默认开启 |
-| `SANDBOX_CPU_PERCENT` | 单任务 CPU 配额（百分比），默认 10（0.1 核） |
+| `SANDBOX_CPU_PERCENT` | 单任务 CPU 上限（百分比），默认 10（0.1 核） |
 | `SANDBOX_MEMORY_MB` | 单任务内存上限，默认 256 |
-| `SANDBOX_MAX_PARALLEL` | 并行沙箱任务数，默认 2（256MB × 2 = 512MB） |
+| `SANDBOX_TOTAL_CPU_PERCENT` | 全局 CPU 上限，默认 50（0.5 核） |
+| `SANDBOX_TOTAL_MEMORY_MB` | 全局内存上限，默认 512 |
+| `SANDBOX_MAX_PARALLEL` | 并发上限，默认 0 表示自动推导；运行中按并发数均分资源 |
 | `WORKSPACE_CLEANUP_DAYS` | 未访问文件自动清理天数，默认 30 |
 | `QUOTA_CREDITS_PER_SECOND` | 沙箱每秒积分，默认 100 |
 | `QUOTA_CREDITS_PER_MB_NET` | 沙箱每 MB 流量积分（双向），默认 1 |
@@ -117,8 +127,9 @@ Python 3.10+。图片处理依赖 Pillow（大图与非常规格式会转成 JPE
 | `QUOTA_GLOBAL_DAILY/WEEKLY/MONTHLY` | 全站额度，默认 500000 / 3000000 / 10000000 |
 | `ADMIN_FILE` | 管理员名单文件，默认 `data/admins.json` |
 | `BLOCK_FILE` | 黑名单文件，默认 `data/blocked.json` |
-| `ADMIN_MAX_TOKENS` | 管理员单次输出上限，默认 393216 |
-| `ADMIN_CONTEXT_TOKENS` | 管理员上下文 token 预算，默认 1048576 |
+| `CONTEXT_MAX_TOKENS` | 普通用户上下文 token 预算，默认 32000，上限为 `ADMIN_CONTEXT_TOKENS` |
+| `ADMIN_MAX_TOKENS` | 管理员单次输出上限，默认 393216，也是 `/length` 的全局上限 |
+| `ADMIN_CONTEXT_TOKENS` | 管理员上下文 token 预算，默认 1048576，也是 `/context` 的全局上限 |
 
 计费规则：1 积分 = 1 输出 token = 4 输入 token = 1/10 MB 文件，各维度向上取整。
 

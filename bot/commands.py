@@ -18,21 +18,62 @@ from services.workspace import WorkspaceTools
 
 PERIOD_LABELS = (("day", "今日"), ("week", "本周"), ("month", "本月"))
 THINKING_VALUES = {"off", "low", "medium", "high", "max", "default"}
+THINKING_LABELS = {
+    "off": "关闭",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "max": "最高",
+}
+PROGRESS_VALUES = {
+    "off": None,
+    "none": None,
+    "关闭": None,
+    "不显示": None,
+    "default": None,
+    "calls": "calls",
+    "brief": "calls",
+    "仅调用": "calls",
+    "on": "calls",
+    "full": "full",
+    "all": "full",
+    "全部": "full",
+}
+
+GROUP_SETTINGS_DENIED = "只有群主、群管理员或 Bot 管理员可以修改本群设置。"
+
+
+def _parse_tokens(raw: str) -> int | None:
+    """解析 4096、32k 这类 token 数量。"""
+    text = (raw or "").strip().lower().replace("_", "")
+    multiplier = 1
+    if text.endswith("k"):
+        text = text[:-1]
+        multiplier = 1000
+    if not text.isdigit():
+        return None
+    value = int(text) * multiplier
+    return value if value > 0 else None
 
 HELP_TEXT = """可用指令：
 /help — 查看帮助
-/about — 查看版本信息
+/about — 查看版本、开源协议与当前设置
 /reset — 清空当前对话上下文
 /quota — 查看剩余额度
 /quota detail — 查看各周期已用/上限
 /workspace — 查看空间占用
 /continue — 继续发送被截断的内容
-/progress — 查看过程显示状态
-/progress on|off|default — 开/关工具过程记录（仅私聊流式）
+/progress — 查看过程显示档位
+/progress off|calls|full|default — 不显示/仅调用/含输出
 /markdown — 查看 Markdown 渲染状态
 /markdown on|off|default — 开/关 Markdown 渲染
-/thinking — 查看当前思考强度
+/thinking — 查看思考强度与思考显示
 /thinking off|low|medium|high|max|default — 调整思考强度
+/thinking show on|off|default — 开/关思考内容显示（仅私聊流式）
+/length — 查看单次输出上限
+/length <tokens>|default — 设置输出上限（不超过管理员上限）
+/context — 查看上下文预算
+/context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）
 /stream — 查看流式输出状态
 /stream on|off|default — 开/关流式输出（仅私聊）
 /motd <地址> — 探测 Minecraft Java 服务器
@@ -72,7 +113,7 @@ class CommandRouter:
         if command in ("/help", "/帮助"):
             return HELP_TEXT
         if command in ("/about", "/关于", "/version", "/版本"):
-            return f"CXBot v{__version__}\n© {datetime.now().year} {__author__}"
+            return await self._about_reply(event)
         if command in ("/quota", "/额度"):
             return await self._quota_reply(event, args)
         if command in ("/workspace", "/空间", "/files", "/文件"):
@@ -81,6 +122,10 @@ class CommandRouter:
             return await self._thinking_reply(event, args)
         if command in ("/progress", "/过程"):
             return await self._progress_reply(event, args)
+        if command in ("/length", "/输出", "/长度"):
+            return await self._length_reply(event, args)
+        if command in ("/context", "/上下文"):
+            return await self._context_reply(event, args)
         if command in ("/markdown", "/md", "/渲染"):
             return await self._markdown_reply(event, args)
         if command in ("/stream", "/流式"):
@@ -106,6 +151,52 @@ class CommandRouter:
                 lines.append(f"群标识：{event.group_openid}")
             return "\n".join(lines)
         return "未知指令。发送 /help 查看可用指令。"
+
+    async def _about_reply(self, event: MessageEvent) -> str:
+        scope = event.context_key
+        markdown = await self._preferences.get(scope, "markdown") != "off"
+        thinking = await self._preferences.get(scope, "thinking")
+        progress = await self._preferences.get(scope, "progress")
+        reasoning = await self._preferences.get(scope, "reasoning")
+
+        if event.kind == "c2c":
+            stream = await self._preferences.get(scope, "stream")
+            stream_label = "关闭" if stream == "off" else "开启"
+            progress_label = self._progress_label(progress)
+            reasoning_label = "开启" if reasoning == "on" else "关闭"
+        else:
+            stream_label = "不支持"
+            progress_label = "不支持"
+            reasoning_label = "不支持"
+
+        lines = [
+            f"CXBot v{__version__}",
+            f"© {datetime.now().year} {__author__}",
+            "",
+            "新一代 QQ 机器人 AI 助手",
+            "",
+            "当前设置",
+            f"Markdown　{'开启' if markdown else '关闭'}",
+            f"流式输出　{stream_label}",
+            f"过程显示　{progress_label}",
+            f"思考强度　{self._thinking_label(thinking)}",
+            f"思考显示　{reasoning_label}",
+            "",
+            "主要功能",
+            "· 流式对话与长文续传",
+            "· 文件读写与工作空间",
+            "· 在线命令执行",
+            "· 网页搜索与抓取",
+            "· 文档解析、图片识别、语音转写",
+            "· 群聊公用与额度管理",
+            "",
+            "通过 AGPL-3.0 协议开源",
+            "请勿商业使用",
+            "github.com/239LAN/CXBot",
+            "",
+            "发送 /help 查看指令",
+        ]
+        return "\n".join(lines)
 
     async def _quota_reply(self, event: MessageEvent, args: list[str]) -> str:
         if self._admins.is_admin(event.user_openid):
@@ -158,17 +249,32 @@ class CommandRouter:
     async def _thinking_reply(self, event: MessageEvent, args: list[str]) -> str:
         scope = event.context_key
         current = await self._preferences.get(scope, "thinking")
+        show = await self._preferences.get(scope, "reasoning") == "on"
 
         if not args:
-            if current is None:
-                return f"当前思考强度：默认（{self._default_thinking()}）"
-            if current == "off":
-                return "当前思考强度：关闭"
-            return f"当前思考强度：{current}"
+            lines = [f"当前思考强度：{self._thinking_label(current)}"]
+            if event.kind == "c2c":
+                lines.append(f"思考显示：{'开启' if show else '关闭'}")
+            else:
+                lines.append("思考显示：群聊不支持")
+            return "\n".join(lines)
 
         value = args[0].lower()
+        if value in ("show", "display", "显示"):
+            if event.kind != "c2c":
+                return "思考显示仅在私聊流式输出中生效。"
+            if len(args) < 2 or args[1].lower() not in ("on", "off", "default"):
+                return "用法：/thinking show on|off|default"
+            mode = args[1].lower()
+            await self._preferences.set(
+                scope, "reasoning", "on" if mode == "on" else None
+            )
+            return f"思考显示已{'开启' if mode == 'on' else '关闭'}。"
+
         if value not in THINKING_VALUES:
             return "思考强度可选：off / low / medium / high / max / default"
+        if not self._can_change_settings(event):
+            return GROUP_SETTINGS_DENIED
         await self._preferences.set(
             scope, "thinking", None if value == "default" else value
         )
@@ -186,17 +292,78 @@ class CommandRouter:
             return "群聊不支持流式过程显示，该设置仅在私聊生效。"
         scope = event.context_key
         current = await self._preferences.get(scope, "progress")
-        enabled = current == "on"
         if not args:
             suffix = "（默认）" if current is None else ""
-            return f"过程显示：{'开启' if enabled else '关闭'}{suffix}"
+            return (
+                f"过程显示：{self._progress_label(current)}{suffix}\n"
+                "可设为 off / calls / full"
+            )
         value = args[0].lower()
-        if value not in ("on", "off", "default"):
-            return "用法：/progress on|off|default"
-        await self._preferences.set(
-            scope, "progress", "on" if value == "on" else None
-        )
-        return f"过程显示已{'开启' if value == 'on' else '关闭'}。"
+        if value not in PROGRESS_VALUES:
+            return "用法：/progress off|calls|full|default"
+        stored = PROGRESS_VALUES[value]
+        await self._preferences.set(scope, "progress", stored)
+        if stored is None:
+            return "过程显示已关闭。"
+        if stored == "calls":
+            return "过程显示已开启：只显示命令与工具调用。"
+        return "过程显示已开启：显示命令、输出与工具结果。"
+
+    async def _length_reply(
+        self, event: MessageEvent, args: list[str]
+    ) -> str:
+        scope = event.context_key
+        cap = self._config.admin_max_tokens
+        current = await self._preferences.get(scope, "length")
+        if not args:
+            value = current or str(cap)
+            suffix = "（默认）" if current is None else ""
+            return (
+                f"单次输出上限：{value} tokens{suffix}\n"
+                f"可设为 256-{cap}，例如 /length 4096"
+            )
+        if not self._can_change_settings(event):
+            return GROUP_SETTINGS_DENIED
+        raw = args[0].lower()
+        if raw == "default":
+            await self._preferences.set(scope, "length", None)
+            return f"单次输出上限已恢复默认（{cap} tokens）。"
+        value = _parse_tokens(raw)
+        if value is None:
+            return "用法：/length <tokens>|default，例如 /length 4096"
+        value = max(256, min(cap, value))
+        await self._preferences.set(scope, "length", str(value))
+        return f"单次输出上限已设为 {value} tokens（管理员上限 {cap}）。"
+
+    async def _context_reply(
+        self, event: MessageEvent, args: list[str]
+    ) -> str:
+        scope = event.context_key
+        cap = self._config.admin_context_tokens
+        if self._admins.is_admin(event.user_openid):
+            default = cap
+        else:
+            default = self._config.context_max_tokens
+        current = await self._preferences.get(scope, "context")
+        if not args:
+            value = current or str(default)
+            suffix = "（默认）" if current is None else ""
+            return (
+                f"上下文预算：{value} tokens{suffix}\n"
+                f"可设为 1024-{cap}，例如 /context 32000"
+            )
+        if not self._can_change_settings(event):
+            return GROUP_SETTINGS_DENIED
+        raw = args[0].lower()
+        if raw == "default":
+            await self._preferences.set(scope, "context", None)
+            return f"上下文预算已恢复默认（{default} tokens）。"
+        value = _parse_tokens(raw)
+        if value is None:
+            return "用法：/context <tokens>|default，例如 /context 32000"
+        value = max(1024, min(cap, value))
+        await self._preferences.set(scope, "context", str(value))
+        return f"上下文预算已设为 {value} tokens（管理员上限 {cap}）。"
 
     async def _markdown_reply(
         self, event: MessageEvent, args: list[str]
@@ -210,6 +377,8 @@ class CommandRouter:
         value = args[0].lower()
         if value not in ("on", "off", "default"):
             return "用法：/markdown on|off|default"
+        if not self._can_change_settings(event):
+            return GROUP_SETTINGS_DENIED
         await self._preferences.set(
             scope, "markdown", "off" if value == "off" else None
         )
@@ -329,7 +498,30 @@ class CommandRouter:
         removed = self._blocks.remove(target)
         return f"已解除拉黑：{target}" if removed else f"不在黑名单：{target}"
 
+    def _can_change_settings(self, event: MessageEvent) -> bool:
+        """私聊可改自己的设置；群聊仅群主、群管理员或 Bot 管理员可改。"""
+        if event.kind != "group":
+            return True
+        if self._admins is not None and self._admins.is_admin(event.user_openid):
+            return True
+        return (event.group_role or "").lower() in ("owner", "admin")
+
     def _default_thinking(self) -> str:
         if not self._config.deepseek_thinking_enabled:
             return "关闭"
         return f"开启，强度 {self._config.deepseek_reasoning_effort}"
+
+    def _thinking_label(self, value: str | None) -> str:
+        if value is None:
+            if not self._config.deepseek_thinking_enabled:
+                return "关闭"
+            value = self._config.deepseek_reasoning_effort
+        return THINKING_LABELS.get(value, value)
+
+    @staticmethod
+    def _progress_label(value: str | None) -> str:
+        if value == "full":
+            return "全部"
+        if value in ("calls", "on"):
+            return "仅调用"
+        return "不显示"

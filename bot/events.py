@@ -69,6 +69,7 @@ class MessageEvent:
     content: str
     user_openid: str
     group_openid: str | None = None
+    group_role: str = ""  # 群内角色：owner / admin / member，非群聊为空
     attachments: list[dict] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
@@ -161,6 +162,7 @@ def parse_message_event(event_type: str, data: dict) -> MessageEvent | None:
             content=content,
             user_openid=user_openid,
             group_openid=group_openid,
+            group_role=str(author.get("member_role") or "").lower(),
             attachments=attachments,
             raw=data,
         )

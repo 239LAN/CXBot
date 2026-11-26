@@ -54,6 +54,22 @@ WEB_TOOL_NAMES = {"web_search", "web_fetch"}
 ATTACHMENT_DOWNLOAD_TIMEOUT = 20.0
 
 RESET_COMMANDS = {"/reset", "/clear", "重置上下文", "清空上下文"}
+SETTINGS_COMMANDS = {
+    "/progress",
+    "/过程",
+    "/markdown",
+    "/md",
+    "/渲染",
+    "/thinking",
+    "/思考",
+    "/stream",
+    "/流式",
+    "/length",
+    "/输出",
+    "/长度",
+    "/context",
+    "/上下文",
+}
 MAX_CHUNKS = 5  # 群聊/回退消息被动回复同一个 msg_id 最多 5 条
 CHUNK_INTERVAL = 0.25
 
@@ -66,6 +82,7 @@ DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 超过后走分片上传
 PENDING_UPLOAD_TTL = 600  # 只发附件后，等待提示词的最长时间（秒）
 MAX_PENDING_ATTACHMENTS = 10
 MAX_PROGRESS_CHARS = 400
+REASONING_PREVIEW_CHARS = 180  # 思考显示只取最近一段，避免挤占正文
 HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
 MAX_FULL_ANSWER_CHARS = 20000
 CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
@@ -108,20 +125,33 @@ def _tool_arg(arguments: str, key: str) -> str:
 
 
 @dataclass
-class ProgressTracker:
-    """汇总工具调用，用于流式过程展示。"""
+class ProgressItem:
+    label: str
+    result: str = ""
 
-    reads: list[str] = field(default_factory=list)
-    commands: list[str] = field(default_factory=list)
-    writes: list[str] = field(default_factory=list)
-    others: list[str] = field(default_factory=list)
+
+@dataclass
+class ProgressTracker:
+    """汇总工具调用，用于流式过程展示。
+
+    show_result=False 时只显示调用了什么；True 时附带结果摘要。
+    """
+
+    show_result: bool = False
+    reads: list[ProgressItem] = field(default_factory=list)
+    commands: list[ProgressItem] = field(default_factory=list)
+    writes: list[ProgressItem] = field(default_factory=list)
+    others: list[ProgressItem] = field(default_factory=list)
+    _last: ProgressItem | None = field(default=None, repr=False)
 
     def record(self, name: str, arguments: str) -> None:
         path = _tool_arg(arguments, "path")
         if name == "read_file":
-            self.reads.append(path or "文件")
+            item = ProgressItem(path or "文件")
+            self.reads.append(item)
         elif name == "run_command":
-            self.commands.append(_tool_arg(arguments, "command") or "命令")
+            item = ProgressItem(_tool_arg(arguments, "command") or "命令")
+            self.commands.append(item)
         elif name in {
             "write_file",
             "append_file",
@@ -132,33 +162,65 @@ class ProgressTracker:
             "delete_file",
             "mkdir",
         }:
-            self.writes.append(path or name)
+            item = ProgressItem(path or name)
+            self.writes.append(item)
         elif name == "list_files":
-            self.others.append("查看了文件列表")
+            item = ProgressItem("查看了文件列表")
+            self.others.append(item)
         elif name == "workspace_usage":
-            self.others.append("查看了空间占用")
+            item = ProgressItem("查看了空间占用")
+            self.others.append(item)
         elif name == "web_search":
-            self.others.append("搜索了网页：" + _short(_tool_arg(arguments, "query"), 40))
+            item = ProgressItem(
+                "搜索了网页：" + _short(_tool_arg(arguments, "query"), 40)
+            )
+            self.others.append(item)
         elif name == "web_fetch":
-            self.others.append("抓取了网页：" + _short(_tool_arg(arguments, "url"), 60))
+            item = ProgressItem(
+                "抓取了网页：" + _short(_tool_arg(arguments, "url"), 60)
+            )
+            self.others.append(item)
         elif name == "save_attachment":
-            self.others.append("保存了附件")
+            item = ProgressItem("保存了附件")
+            self.others.append(item)
         elif name == "send_file":
-            self.others.append("发送了文件：" + _short(path, 40))
+            item = ProgressItem("发送了文件：" + _short(path, 40))
+            self.others.append(item)
         else:
-            self.others.append("调用了 " + name)
+            item = ProgressItem("调用了 " + name)
+            self.others.append(item)
+        self._last = item
+
+    def add_result(self, result: str) -> None:
+        """记录上一次工具调用的结果摘要（仅在完整档位展示）。"""
+        if self._last is not None and result:
+            self._last.result = _short(result, 120)
+
+    @staticmethod
+    def _render_items(
+        lines: list[str], items: list[ProgressItem], limit: int, show_result: bool
+    ) -> None:
+        for item in items[-limit:]:
+            lines.append(f"> {_short(item.label, 80)}")
+            if show_result and item.result:
+                lines.append(f"↳ {item.result}")
 
     def render(self) -> str:
         lines: list[str] = []
         if self.reads:
             lines.append(f"【阅读了{len(self.reads)}个文件】")
-            lines.extend(f"> {_short(item)}" for item in self.reads[-3:])
+            self._render_items(lines, self.reads, 3, self.show_result)
         if self.commands:
             lines.append(f"【执行了{len(self.commands)}条命令】")
-            lines.extend(f"> {_short(item)}" for item in self.commands[-3:])
+            self._render_items(lines, self.commands, 3, self.show_result)
         if self.writes:
             lines.append(f"【修改了{len(self.writes)}个文件】")
-        lines.extend(f"【{item}】" for item in self.others[-5:])
+            if self.show_result:
+                self._render_items(lines, self.writes, 3, True)
+        for item in self.others[-5:]:
+            lines.append(f"【{item.label}】")
+            if self.show_result and item.result:
+                lines.append(f"↳ {item.result}")
         text = "\n".join(lines)
         if len(text) > MAX_PROGRESS_CHARS:
             text = text[: MAX_PROGRESS_CHARS - 1].rstrip() + "…"
@@ -345,6 +407,16 @@ class ChatHandler:
             return
 
         if text.startswith("/"):
+            command = text.split()[0].lower()
+            # 群@消息不保证带 member_role，改设置前补查一次群成员角色
+            if (
+                event.kind == "group"
+                and not event.group_role
+                and command in SETTINGS_COMMANDS
+            ):
+                event.group_role = await self._api.group_member_role(
+                    event.group_openid or "", event.user_openid
+                )
             reply = await self._commands.route(event, text)
             await self._reply(event, reply)
             return
@@ -354,8 +426,10 @@ class ChatHandler:
             return
 
         unlimited = self._admins.is_admin(event.user_openid)
+        output_limit = await self._output_limit(key)
+        context_limit = await self._context_limit(key, unlimited)
         if unlimited:
-            remaining = self._admin_output_tokens()
+            remaining = output_limit
             logger.info("管理员不限额度：%s", event.user_openid)
         else:
             remaining, reason = await self._quota.check(key)
@@ -363,6 +437,7 @@ class ChatHandler:
                 logger.info("额度不足，拒绝请求 %s：%s", key, reason)
                 await self._reply(event, reason)
                 return
+            remaining = min(remaining, output_limit)
 
         images = await self._load_images(event)
         doc_blocks, doc_errors = await self._load_documents(event)
@@ -414,7 +489,7 @@ class ChatHandler:
                 else attachment_note
             )
 
-        messages = self._contexts.load(key, **self._context_load_args(unlimited)) + [
+        messages = self._contexts.load(key, max_tokens=context_limit) + [
             {"role": "user", "content": self._user_content(prompt_text, images)}
         ]
         history_text = self._history_text(
@@ -424,7 +499,12 @@ class ChatHandler:
         thinking = await self._preferences.get(key, "thinking")
         thinking_enabled, reasoning_effort = self._thinking_params(thinking)
         stream_off = await self._preferences.get(key, "stream") == "off"
-        progress_enabled = await self._preferences.get(key, "progress") == "on"
+        progress_mode = self._progress_mode(
+            await self._preferences.get(key, "progress")
+        )
+        thinking_display = (
+            await self._preferences.get(key, "reasoning") == "on"
+        )
         markdown_on = await self._preferences.get(key, "markdown") != "off"
 
         if event.kind == "c2c":
@@ -446,6 +526,8 @@ class ChatHandler:
                     tools=c2c_tools,
                     reply_seq={"next": 1, "reserve": 1},
                     unlimited=unlimited,
+                    output_limit=output_limit,
+                    context_tokens=context_limit,
                     markdown=markdown_on,
                 )
                 return
@@ -457,7 +539,10 @@ class ChatHandler:
                     thinking_enabled,
                     reasoning_effort,
                     unlimited=unlimited,
-                    progress_enabled=progress_enabled,
+                    output_limit=output_limit,
+                    context_tokens=context_limit,
+                    progress_mode=progress_mode,
+                    thinking_display=thinking_display,
                     markdown_enabled=markdown_on,
                 )
             except QQBotAPIError:
@@ -473,12 +558,14 @@ class ChatHandler:
                     tools=c2c_tools,
                     reply_seq={"next": 1, "reserve": 1},
                     unlimited=unlimited,
+                    output_limit=output_limit,
+                    context_tokens=context_limit,
                     markdown=markdown_on,
                 )
                 return
             if ok and answer:
                 self._contexts.append_turn(
-                    key, history_text, answer, **self._context_load_args(unlimited)
+                    key, history_text, answer, max_tokens=context_limit
                 )
             return
 
@@ -498,6 +585,8 @@ class ChatHandler:
             history_text,
             tools=group_tools,
             unlimited=unlimited,
+            output_limit=output_limit,
+            context_tokens=context_limit,
             markdown=markdown_on,
         )
 
@@ -814,11 +903,15 @@ class ChatHandler:
         thinking_enabled: bool,
         reasoning_effort: str,
         unlimited: bool = False,
-        progress_enabled: bool = False,
+        output_limit: int | None = None,
+        context_tokens: int | None = None,
+        progress_mode: str = "off",
+        thinking_display: bool = False,
         markdown_enabled: bool = True,
     ) -> tuple[str, bool]:
         """单聊流式回复，支持多轮工具调用、过程展示与断点续传。"""
         working = list(messages)
+        limit = output_limit or self._admin_output_tokens()
         tools = (
             self._workspace.schemas()
             + self._web.schemas()
@@ -829,10 +922,17 @@ class ChatHandler:
         system_suffix = "" if markdown_enabled else PLAIN_TEXT_SUFFIX
 
         reserve = len(CONTINUE_HINT) + 8
-        if progress_enabled:
+        if progress_mode != "off":
             reserve += MAX_PROGRESS_CHARS
+        if thinking_display:
+            reserve += REASONING_PREVIEW_CHARS + 16
         answer_limit = max(300, STREAM_MAX_CHARS - reserve)
-        progress = ProgressTracker() if progress_enabled else None
+        progress = (
+            None
+            if progress_mode == "off"
+            else ProgressTracker(show_result=progress_mode == "full")
+        )
+        reasoning_text = ""
 
         full_answer = ""
         answer = ""
@@ -849,10 +949,27 @@ class ChatHandler:
         push_lock = asyncio.Lock()
 
         def display_content() -> str:
-            note = progress.render() if progress else ""
-            if note and answer:
-                return f"{note}\n\n{answer}"
-            return note or answer
+            blocks: list[str] = []
+            if progress:
+                note = progress.render()
+                if note:
+                    blocks.append(note)
+            thought = reasoning_block()
+            if thought:
+                blocks.append(thought)
+            if answer:
+                blocks.append(answer)
+            return "\n\n".join(blocks)
+
+        def reasoning_block() -> str:
+            if not thinking_display:
+                return ""
+            text = reasoning_text.strip()
+            if not text:
+                return ""
+            if len(text) > REASONING_PREVIEW_CHARS:
+                text = "…" + text[-(REASONING_PREVIEW_CHARS - 1) :]
+            return f"【思考】\n{text}"
 
         async def push(content: str) -> None:
             nonlocal started, stream_msg_id, index, last_flush
@@ -903,6 +1020,12 @@ class ChatHandler:
                 stream_broken = True
                 logger.exception("流式分片发送失败：%s", event.user_openid)
 
+        async def on_reasoning(chunk: str) -> None:
+            nonlocal reasoning_text
+            if len(reasoning_text) < 4000:
+                reasoning_text += chunk
+            await flush()
+
         async def run_tool_with_heartbeat(coro) -> str:
             task = asyncio.create_task(coro)
             while True:
@@ -945,6 +1068,7 @@ class ChatHandler:
                         thinking_enabled=thinking_enabled,
                         reasoning_effort=reasoning_effort,
                         system_suffix=system_suffix,
+                        on_reasoning=on_reasoning if thinking_display else None,
                     )
                 ) as stream:
                     async for delta in stream:
@@ -966,9 +1090,11 @@ class ChatHandler:
             if state.finish_reason == "length" and not state.tool_calls:
                 output_cut = True
             if unlimited:
-                remaining = self._admin_output_tokens()
+                remaining = limit
             else:
-                remaining = await self._quota.remaining(event.context_key)
+                remaining = min(
+                    await self._quota.remaining(event.context_key), limit
+                )
 
             if len(full_answer) >= MAX_FULL_ANSWER_CHARS:
                 break
@@ -1013,6 +1139,9 @@ class ChatHandler:
                         event, tool_name, arguments, reply_seq, unlimited=unlimited
                     )
                 )
+                if progress is not None and progress.show_result:
+                    progress.add_result(result)
+                    await flush(force=True)
                 working.append(
                     {
                         "role": "tool",
@@ -1332,16 +1461,47 @@ class ChatHandler:
         """管理员单次输出上限。"""
         return self._config.admin_max_tokens
 
-    def _context_load_args(self, unlimited: bool) -> dict:
-        """管理员按 token 预算保留上下文，普通用户按轮数裁剪。"""
+    async def _output_limit(self, key: str) -> int:
+        """会话输出上限：用户设置值，受管理员上限约束。"""
+        cap = self._admin_output_tokens()
+        raw = await self._preferences.get(key, "length")
+        if not raw:
+            return cap
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return cap
+        return max(256, min(cap, value))
+
+    async def _context_limit(self, key: str, unlimited: bool) -> int:
+        """会话上下文预算：普通用户默认较小，管理员默认最大。"""
+        cap = self._config.admin_context_tokens
         if unlimited:
-            return {"max_tokens": self._config.admin_context_tokens}
-        return {}
+            default = cap
+        else:
+            default = self._config.context_max_tokens
+        raw = await self._preferences.get(key, "context")
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(1024, min(cap, value))
 
     @staticmethod
     def _round_limit(unlimited: bool) -> int | None:
         """管理员工具轮次不限；普通用户受 MAX_TOOL_ROUNDS 限制。"""
         return None if unlimited else MAX_TOOL_ROUNDS
+
+    @staticmethod
+    def _progress_mode(value: str | None) -> str:
+        """过程显示档位：off / calls / full（兼容旧值 on）。"""
+        if value == "full":
+            return "full"
+        if value in ("calls", "on"):
+            return "calls"
+        return "off"
 
     def _thinking_params(self, value: str | None) -> tuple[bool, str]:
         if not value:
@@ -1367,10 +1527,13 @@ class ChatHandler:
         tools: list[dict] | None = None,
         reply_seq: dict | None = None,
         unlimited: bool = False,
+        output_limit: int | None = None,
+        context_tokens: int | None = None,
         markdown: bool = True,
     ) -> None:
         """群聊与流式兜底：非流式回复，支持网页搜索/抓取工具。"""
         working = list(messages)
+        limit = output_limit or self._admin_output_tokens()
         tool_schemas = self._web.schemas() if tools is None else tools
         system_suffix = "" if markdown else PLAIN_TEXT_SUFFIX
         answer = ""
@@ -1403,9 +1566,9 @@ class ChatHandler:
                 break
 
             if unlimited:
-                max_tokens = self._admin_output_tokens()
+                max_tokens = limit
             else:
-                remaining = await self._quota.remaining(key)
+                remaining = min(await self._quota.remaining(key), limit)
                 if remaining <= 0:
                     logger.info("额度已用完，停止后续工具轮次：%s", key)
                     break
@@ -1451,7 +1614,10 @@ class ChatHandler:
         if not answer:
             answer = FALLBACK_REPLY
         self._contexts.append_turn(
-            key, user_text, answer, **self._context_load_args(unlimited)
+            key,
+            user_text,
+            answer,
+            max_tokens=context_tokens or self._config.admin_context_tokens,
         )
         await self._reply(
             event,

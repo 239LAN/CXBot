@@ -42,6 +42,8 @@ async def run(config: Config) -> None:
                 allow_network=config.sandbox_network,
                 cpu_percent=config.sandbox_cpu_percent,
                 memory_bytes=config.sandbox_memory_bytes,
+                total_cpu_percent=config.sandbox_total_cpu_percent,
+                total_memory_bytes=config.sandbox_total_memory_bytes,
                 max_parallel=config.sandbox_max_parallel,
             ),
             cleanup_days=config.workspace_cleanup_days,

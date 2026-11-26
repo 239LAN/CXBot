@@ -75,6 +75,7 @@ class Config:
     system_prompt: str
     context_dir: Path
     max_turns: int
+    context_max_tokens: int
 
     workspace_dir: Path
     workspace_quota_bytes: int
@@ -84,6 +85,8 @@ class Config:
     sandbox_network: bool
     sandbox_cpu_percent: int
     sandbox_memory_bytes: int
+    sandbox_total_cpu_percent: int
+    sandbox_total_memory_bytes: int
     sandbox_max_parallel: int
 
     quota_file: Path
@@ -145,6 +148,13 @@ class Config:
 
         context_dir = Path(_get("CONTEXT_DIR") or DATA_DIR / "contexts")
         workspace_dir = Path(_get("WORKSPACE_DIR") or DATA_DIR / "workspaces")
+        admin_context_tokens = max(
+            1024, _get_int("ADMIN_CONTEXT_TOKENS", 1048576)
+        )
+        context_max_tokens = min(
+            admin_context_tokens,
+            max(1024, _get_int("CONTEXT_MAX_TOKENS", 32000)),
+        )
 
         return cls(
             app_id=app_id,
@@ -162,13 +172,12 @@ class Config:
             ),
             deepseek_thinking_enabled=_get_bool("DEEPSEEK_THINKING", True),
             deepseek_reasoning_effort=_get("DEEPSEEK_REASONING_EFFORT", "low").lower(),
-            admin_context_tokens=max(
-                1024, _get_int("ADMIN_CONTEXT_TOKENS", 1048576)
-            ),
+            admin_context_tokens=admin_context_tokens,
             admin_max_tokens=max(512, _get_int("ADMIN_MAX_TOKENS", 393216)),
             system_prompt=_get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT,
             context_dir=context_dir,
             max_turns=max(1, _get_int("CONTEXT_MAX_TURNS", 10)),
+            context_max_tokens=context_max_tokens,
             workspace_dir=workspace_dir,
             workspace_quota_bytes=max(1, _get_int("WORKSPACE_QUOTA_MB", 50)) * 1024 * 1024,
             workspace_admin_quota_bytes=max(
@@ -185,7 +194,14 @@ class Config:
             sandbox_memory_bytes=max(
                 32 * 1024 * 1024, _get_int("SANDBOX_MEMORY_MB", 256) * 1024 * 1024
             ),
-            sandbox_max_parallel=max(1, _get_int("SANDBOX_MAX_PARALLEL", 2)),
+            sandbox_total_cpu_percent=max(
+                1, min(100, _get_int("SANDBOX_TOTAL_CPU_PERCENT", 50))
+            ),
+            sandbox_total_memory_bytes=max(
+                64 * 1024 * 1024,
+                _get_int("SANDBOX_TOTAL_MEMORY_MB", 512) * 1024 * 1024,
+            ),
+            sandbox_max_parallel=max(0, _get_int("SANDBOX_MAX_PARALLEL", 0)),
             quota_file=Path(_get("QUOTA_FILE") or DATA_DIR / "quotas.json"),
             quota_user_daily=max(0, _get_int("QUOTA_USER_DAILY", 80000)),
             quota_user_weekly=max(0, _get_int("QUOTA_USER_WEEKLY", 320000)),

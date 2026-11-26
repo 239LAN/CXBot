@@ -1,8 +1,9 @@
 """工作空间命令执行沙箱。
 
 资源限制：
-- 单任务：CPU 0.1 核、内存 256MB（Linux 通过 systemd-run 的 cgroup 实现）
-- 全局：最多 2 个任务并行（对应 512MB 内存），CPU 合计不超过 0.5 核
+- 单任务上限：CPU 0.1 核、内存 256MB
+- 全局上限：CPU 0.5 核、内存 512MB
+- 并发数按“总量不超”自动推导，运行中的任务均分 CPU 与内存
 - 网络流量：通过 systemd 的 IPAccounting 统计双向字节数，用于计费
 
 Linux 优先使用 bubblewrap（bwrap）隔离进程，只把用户工作空间挂成可写目录；
@@ -35,10 +36,26 @@ MAX_TIMEOUT = 30.0
 MAX_OUTPUT_CHARS = 8000
 MEMORY_LIMIT = 256 * 1024 * 1024
 FILE_SIZE_LIMIT = 16 * 1024 * 1024
-DEFAULT_CPU_PERCENT = 10  # 0.1 核
-DEFAULT_MAX_PARALLEL = 2  # 2 × 256MB = 512MB
+DEFAULT_CPU_PERCENT = 10  # 单任务上限：0.1 核
+DEFAULT_TOTAL_CPU_PERCENT = 50  # 全局上限：0.5 核
+TOTAL_MEMORY_LIMIT = 512 * 1024 * 1024
+MIN_TASK_MEMORY = 64 * 1024 * 1024
+MIN_TASK_CPU_PERCENT = 2
 
 _SECRET_KEYS = ("DEEPSEEK_API_KEY", "QQ_CLIENT_SECRET", "QQ_APP_ID")
+
+
+def resolve_max_parallel(
+    total_cpu_percent: int, total_memory_bytes: int, max_parallel: int = 0
+) -> int:
+    """并发数：显式上限优先，否则按全局总量与单任务下限推导。"""
+    if max_parallel and max_parallel > 0:
+        return max_parallel
+    auto = min(
+        total_memory_bytes // MIN_TASK_MEMORY,
+        total_cpu_percent // MIN_TASK_CPU_PERCENT,
+    )
+    return max(1, auto)
 
 
 @dataclass
@@ -58,15 +75,23 @@ class CommandSandbox:
         allow_network: bool = True,
         cpu_percent: int = DEFAULT_CPU_PERCENT,
         memory_bytes: int = MEMORY_LIMIT,
-        max_parallel: int = DEFAULT_MAX_PARALLEL,
+        total_cpu_percent: int = DEFAULT_TOTAL_CPU_PERCENT,
+        total_memory_bytes: int = TOTAL_MEMORY_LIMIT,
+        max_parallel: int = 0,
     ) -> None:
         self._mode = mode if mode in {"auto", "bwrap", "plain"} else "auto"
         self._max_output = max_output_chars
         self._allow_network = allow_network
-        self._cpu_percent = max(1, min(100, cpu_percent))
-        self._memory = max(32 * 1024 * 1024, memory_bytes)
-        self._max_parallel = max(1, max_parallel)
+        self._cpu_percent = max(MIN_TASK_CPU_PERCENT, min(100, cpu_percent))
+        self._memory = max(MIN_TASK_MEMORY, memory_bytes)
+        self._total_cpu = max(self._cpu_percent, total_cpu_percent)
+        self._total_memory = max(self._memory, total_memory_bytes)
+        # 并发数按“总量不超、均分资源”自动推导：内存至少 64MB、CPU 至少 2%
+        self._max_parallel = resolve_max_parallel(
+            self._total_cpu, self._total_memory, max_parallel
+        )
         self._slots = asyncio.Semaphore(self._max_parallel)
+        self._active = 0
         self._bwrap = shutil.which("bwrap") if os.name == "posix" else None
         self._bwrap_usable = False
         self._systemd_run: str | None = None
@@ -78,6 +103,24 @@ class CommandSandbox:
                 )
         if os.name == "posix":
             self._systemd_run = self._probe_systemd_run()
+        logger.info(
+            "沙箱最大并发 %d，单任务上限 CPU %d%% / %dMB，全局 %d%% / %dMB",
+            self._max_parallel,
+            self._cpu_percent,
+            self._memory // (1024 * 1024),
+            self._total_cpu,
+            self._total_memory // (1024 * 1024),
+        )
+
+    def _limits_for(self, active: int) -> tuple[int, int]:
+        """按当前并发数均分资源，并受单任务上限约束。"""
+        count = max(1, active)
+        cpu = min(self._cpu_percent, self._total_cpu / count)
+        memory = min(self._memory, self._total_memory // count)
+        return (
+            max(MIN_TASK_CPU_PERCENT, int(cpu)),
+            max(MIN_TASK_MEMORY, int(memory)),
+        )
 
     async def run(
         self,
@@ -106,67 +149,73 @@ class CommandSandbox:
                 "沙箱不可用：bubblewrap 无法创建命名空间，请检查内核配置或改用 SANDBOX_MODE=plain"
             )
 
-        argv = self._build_argv(cwd, command.strip(), use_bwrap)
         env = self._build_env(cwd)
-        unit = ""
-        if self._systemd_run:
-            unit = f"cxbot-sbx-{secrets.token_hex(6)}"
-            argv = self._wrap_systemd(unit, argv)
 
-        # 并行任务会排队等待空闲槽位，避免单任务阻塞其他会话
+        # 并行任务按槽位排队；进入后按当前并发数均分 CPU 与内存
         async with self._slots:
-            started = time.monotonic()
-            preexec = None
-            if os.name == "posix" and not self._systemd_run:
-                # 没有 systemd cgroup 时用 rlimit 兜底：内存与 CPU 时间硬上限
-                preexec = self._make_preexec(seconds)
+            self._active += 1
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=str(cwd),
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=(os.name == "posix"),
-                    preexec_fn=preexec,
-                )
-            except OSError as exc:
-                logger.exception("命令启动失败")
-                return SandboxResult(f"命令启动失败：{exc}")
+                cpu_percent, memory = self._limits_for(self._active)
+                argv = self._build_argv(cwd, command.strip(), use_bwrap)
+                unit = ""
+                if self._systemd_run:
+                    unit = f"cxbot-sbx-{secrets.token_hex(6)}"
+                    argv = self._wrap_systemd(unit, argv, cpu_percent, memory)
 
-            buffer = bytearray()
-            stats = {"total": 0}
-            cap = 64 * 1024
+                started = time.monotonic()
+                preexec = None
+                if os.name == "posix" and not self._systemd_run:
+                    # 没有 systemd cgroup 时用 rlimit 兜底：内存与 CPU 时间硬上限
+                    preexec = self._make_preexec(seconds, memory)
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        cwd=str(cwd),
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        start_new_session=(os.name == "posix"),
+                        preexec_fn=preexec,
+                    )
+                except OSError as exc:
+                    logger.exception("命令启动失败")
+                    return SandboxResult(f"命令启动失败：{exc}")
 
-            async def drain() -> None:
-                while True:
-                    chunk = await proc.stdout.read(8192)
-                    if not chunk:
-                        break
-                    stats["total"] += len(chunk)
-                    if len(buffer) < cap:
-                        buffer.extend(chunk[: cap - len(buffer)])
+                buffer = bytearray()
+                stats = {"total": 0}
+                cap = 64 * 1024
 
-            read_task = asyncio.create_task(drain())
-            timed_out = False
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=seconds)
-            except asyncio.TimeoutError:
-                timed_out = True
-                self._kill(proc)
-                await proc.wait()
+                async def drain() -> None:
+                    while True:
+                        chunk = await proc.stdout.read(8192)
+                        if not chunk:
+                            break
+                        stats["total"] += len(chunk)
+                        if len(buffer) < cap:
+                            buffer.extend(chunk[: cap - len(buffer)])
 
-            try:
-                await asyncio.wait_for(read_task, timeout=2)
-            except asyncio.TimeoutError:
-                read_task.cancel()
-                await asyncio.gather(read_task, return_exceptions=True)
+                read_task = asyncio.create_task(drain())
+                timed_out = False
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=seconds)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    self._kill(proc)
+                    await proc.wait()
 
-            elapsed = time.monotonic() - started
-            network_bytes = self._ip_bytes(unit) if unit else 0
-            if usage is not None:
-                usage["sandbox_seconds"] = elapsed
-                usage["network_bytes"] = network_bytes
+                try:
+                    await asyncio.wait_for(read_task, timeout=2)
+                except asyncio.TimeoutError:
+                    read_task.cancel()
+                    await asyncio.gather(read_task, return_exceptions=True)
+
+                elapsed = time.monotonic() - started
+                network_bytes = self._ip_bytes(unit) if unit else 0
+                if usage is not None:
+                    usage["sandbox_seconds"] = elapsed
+                    usage["network_bytes"] = network_bytes
+            finally:
+                self._active -= 1
 
         if timed_out:
             return SandboxResult(
@@ -231,14 +280,16 @@ class CommandSandbox:
             return None
         return binary
 
-    def _wrap_systemd(self, unit: str, argv: list[str]) -> list[str]:
+    def _wrap_systemd(
+        self, unit: str, argv: list[str], cpu_percent: int, memory: int
+    ) -> list[str]:
         return [
             self._systemd_run or "systemd-run",
             "--quiet",
             "--scope",
             f"--unit={unit}",
-            f"--property=CPUQuota={self._cpu_percent}%",
-            f"--property=MemoryMax={self._memory}",
+            f"--property=CPUQuota={cpu_percent}%",
+            f"--property=MemoryMax={memory}",
             "--property=MemorySwapMax=0",
             "--property=TasksMax=64",
             "--property=IPAccounting=yes",
@@ -353,10 +404,9 @@ class CommandSandbox:
             "PYTHONIOENCODING": "utf-8",
         }
 
-    def _make_preexec(self, seconds: float):
+    def _make_preexec(self, seconds: float, memory: int):
         if resource is None:
             return None
-        memory = self._memory
 
         def limit() -> None:
             try:

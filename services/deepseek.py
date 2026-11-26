@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -157,10 +157,12 @@ class DeepSeekClient:
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
         system_suffix: str = "",
+        on_reasoning: Callable[[str], Awaitable[None]] | None = None,
     ) -> AsyncIterator[str]:
         """流式对话，逐段产出正文增量。
 
         思考内容、工具调用与 usage 写入 state；不传 state 时只输出正文。
+        on_reasoning 用于实时接收思考增量（仅用于展示）。
         """
         payload = self._build_payload(
             history,
@@ -207,11 +209,14 @@ class DeepSeekClient:
                     state.finish_reason = finish
                 delta = choice.get("delta") or {}
 
-                if state is not None:
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning:
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    if state is not None:
                         state.reasoning_content += reasoning
+                    if on_reasoning is not None:
+                        await on_reasoning(reasoning)
 
+                if state is not None:
                     for call in delta.get("tool_calls") or []:
                         self._merge_tool_call(tool_slots, call)
 

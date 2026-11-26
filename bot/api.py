@@ -81,6 +81,34 @@ class QQBotAPI:
             raise QQBotAPIError(200, None, "网关响应缺少 url", "/gateway")
         return url
 
+    async def group_member_role(
+        self, group_openid: str, member_openid: str
+    ) -> str:
+        """查询群成员角色：owner / admin / member；查不到时返回空字符串。"""
+        if not (group_openid and member_openid):
+            return ""
+        try:
+            data = await self._request(
+                "GET", f"/v2/groups/{group_openid}/members/{member_openid}"
+            )
+        except QQBotAPIError:
+            logger.debug("查询群成员角色失败：%s", member_openid, exc_info=True)
+            return ""
+        if isinstance(data.get("member"), dict):
+            data = data["member"]
+        for key in ("member_role", "role", "member_role_type"):
+            value = str(data.get(key) or "").lower()
+            if value:
+                return value
+        roles = data.get("roles")
+        if isinstance(roles, list):
+            joined = " ".join(str(item).lower() for item in roles)
+            if "owner" in joined or "群主" in joined:
+                return "owner"
+            if "admin" in joined or "管理" in joined:
+                return "admin"
+        return ""
+
     async def send_c2c_message(
         self,
         openid: str,
