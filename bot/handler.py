@@ -1671,15 +1671,19 @@ class ChatHandler:
         reply_seq: dict,
         unlimited: bool = False,
     ) -> str:
-        """AI 主动调用：生成图片、发送给用户并按固定积分计费。"""
+        """AI 主动调用：生成图片、发送给用户并按模型倍率计费。"""
         if not self._image.enabled:
             return "生成失败：图片生成未启用"
-        cost = self._image.credits
+        try:
+            prompt, model, size = self._image.parse(arguments)
+        except ImageError as exc:
+            return f"生成失败：{exc}"
+        cost = self._image.cost(model)
         if not unlimited:
             remaining = await self._quota.remaining(event.context_key)
             if cost > remaining:
                 return (
-                    f"生成失败：额度不足（本次固定消耗 {cost} 积分，"
+                    f"生成失败：额度不足（本次预计消耗 {cost} 积分，"
                     f"剩余 {remaining} 积分）。可以先用 /quota 查看用量。"
                 )
 
@@ -1688,7 +1692,7 @@ class ChatHandler:
             return "生成失败：本次消息的被动回复次数已用完"
 
         try:
-            data, ext = await self._image.generate(arguments)
+            data, ext = await self._image.generate(prompt, model, size)
         except ImageError as exc:
             return f"生成失败：{exc}"
         except Exception:
@@ -1722,7 +1726,7 @@ class ChatHandler:
             return f"图片已生成并发送（管理员不计费）。回复时不要提及模型名称。"
         credits = await self._quota.charge(event.context_key, credits=cost)
         return (
-            f"图片已生成并发送，本次固定消耗 {credits} 积分。"
+            f"图片已生成并发送，本次消耗 {credits} 积分。"
             "回复时不要提及模型名称或内部参数。"
         )
 

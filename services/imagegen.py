@@ -1,7 +1,8 @@
 """图片生成：OpenAI 兼容 /images/generations，支持配置多个模型由 AI 选择。
 
-模型清单来自 IMAGE_GEN_MODELS（「模型ID|难度说明」用分号分隔），
-工具 schema 里会把模型名与难度说明一起给模型参考；
+模型清单来自 IMAGE_GEN_MODELS（「模型ID|倍率|难度说明」用分号分隔），
+扣费 = 基准积分 × 模型倍率 × 图片张数；
+工具 schema 里会把模型与相对成本给模型参考；
 模型名属于内部信息，回复中禁止向用户透露。
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 
 import aiohttp
 
@@ -62,6 +64,16 @@ class ImageClient:
     def credits(self) -> int:
         return self._config.image_gen_credits
 
+    def rate(self, model: str) -> float:
+        for name, rate, _desc in self._models:
+            if name == model:
+                return rate
+        return 1.0
+
+    def cost(self, model: str, count: int = 1) -> int:
+        """扣费 = 基准积分 × 模型倍率 × 图片张数，向上取整。"""
+        return math.ceil(self.credits * self.rate(model) * max(1, count))
+
     def _default_model(self) -> str:
         return self._models[0][0] if self._models else ""
 
@@ -72,12 +84,13 @@ class ImageClient:
         if not self.enabled:
             return []
         models_desc = "；".join(
-            f"{name}（{desc}）" if desc else name for name, desc in self._models
+            f"{name}（{desc or f'成本倍率 {rate:g}'}）"
+            for name, rate, desc in self._models
         )
         description = (
             "根据文字描述生成一张图片并直接发给用户。"
-            f"一次调用固定消耗 {self.credits} 积分。"
-            f"可用模型（画质与成本从低到高）：{models_desc}。"
+            f"计费为基准 {self.credits} 积分 × 所选模型倍率，倍率越高通常画质越好、消耗越多。"
+            f"可用模型（按成本从低到高）：{models_desc}。"
             "请根据任务难度自行选择 model，不要询问用户用哪个模型；"
             "模型名称是内部信息，禁止在回复中向用户透露，也不允许用户指定模型。"
             "prompt 要具体：主体、风格、构图、光线、画面内文字等；"
@@ -98,7 +111,7 @@ class ImageClient:
                             },
                             "model": {
                                 "type": "string",
-                                "enum": [name for name, _ in self._models],
+                                "enum": [name for name, _rate, _desc in self._models],
                                 "description": "按任务难度自行选择，用户不能指定",
                             },
                             "size": {
@@ -114,12 +127,13 @@ class ImageClient:
         ]
 
     def _sanitize(self, text: str) -> str:
-        for name, _ in self._models:
+        for name, _rate, _desc in self._models:
             if name:
                 text = text.replace(name, "该模型")
         return text[:300]
 
-    def _parse_args(self, arguments: str) -> tuple[str, str, str]:
+    def parse(self, arguments: str) -> tuple[str, str, str]:
+        """解析工具参数，返回 (prompt, model, size)；不合法时抛 ImageError。"""
         try:
             args = json.loads(arguments or "{}")
         except ValueError as exc:
@@ -132,18 +146,17 @@ class ImageClient:
         if len(prompt) > MAX_PROMPT_CHARS:
             prompt = prompt[:MAX_PROMPT_CHARS]
         model = str(args.get("model") or "").strip()
-        if model not in {name for name, _ in self._models}:
+        if model not in {name for name, _rate, _desc in self._models}:
             model = self._default_model()
         size = str(args.get("size") or "").strip()
         if size not in self._sizes:
             size = self._default_size()
         return prompt, model, size
 
-    async def generate(self, arguments: str) -> tuple[bytes, str]:
+    async def generate(self, prompt: str, model: str, size: str) -> tuple[bytes, str]:
         """调用图片接口，返回 (图片字节, 扩展名)。失败抛出 ImageError。"""
         if not self.enabled:
             raise ImageError("图片生成未启用")
-        prompt, model, size = self._parse_args(arguments)
 
         payload = {
             "model": model,

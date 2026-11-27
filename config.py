@@ -58,18 +58,37 @@ def _get_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in raw.replace("\n", ",").split(",") if item.strip()]
 
 
-def _get_model_catalog(name: str, default: str) -> list[tuple[str, str]]:
-    """解析「模型ID|难度说明」列表，用分号分隔，说明里可以带逗号。"""
+def _get_model_catalog(name: str, default: str) -> list[tuple[str, float, str]]:
+    """解析「模型ID|倍率|说明」列表，用分号分隔。
+
+    倍率可省略（默认 1），也可写成 0.75x；旧格式「模型ID|难度说明」仍然兼容。
+    """
     raw = _get(name) or default
-    catalog: list[tuple[str, str]] = []
+    catalog: list[tuple[str, float, str]] = []
     for chunk in raw.replace("\n", ";").split(";"):
         item = chunk.strip()
         if not item:
             continue
-        model, _, desc = item.partition("|")
-        model = model.strip()
-        if model:
-            catalog.append((model, desc.strip()))
+        parts = [part.strip() for part in item.split("|")]
+        model = parts[0]
+        if not model:
+            continue
+        rate = 1.0
+        desc = ""
+        if len(parts) > 1 and parts[1]:
+            try:
+                value = float(parts[1].rstrip("xX"))
+            except ValueError:
+                desc = "|".join(parts[1:]).strip()
+            else:
+                if value > 0:
+                    rate = value
+                    desc = "|".join(parts[2:]).strip()
+                else:
+                    desc = "|".join(parts[1:]).strip()
+        elif len(parts) > 2:
+            desc = "|".join(parts[2:]).strip()
+        catalog.append((model, rate, desc))
     return catalog
 
 
@@ -167,7 +186,7 @@ class Config:
     image_gen_enabled: bool
     image_gen_base_url: str
     image_gen_api_key: str
-    image_gen_models: list[tuple[str, str]]
+    image_gen_models: list[tuple[str, float, str]]
     image_gen_sizes: list[str]
     image_gen_timeout: float
     image_gen_credits: int
@@ -207,9 +226,9 @@ class Config:
         image_gen_api_key = _get("IMAGE_GEN_API_KEY") or deepseek_api_key
         image_gen_models = _get_model_catalog(
             "IMAGE_GEN_MODELS",
-            "flux.1-schnell|简单快速：草图、简笔画、简单插画"
-            ";flux.1-dev|日常均衡：常见写实与插画"
-            ";gpt-image-1|高质量：复杂构图、精细细节、画面内文字",
+            "gpt-image-2|0.75;gpt-image-2.5|1;gpt-image-2.5-flare|1.25"
+            ";gpt-image-2.5-sunburst|1.5;gpt-image-2.6-flare|1.75"
+            ";gpt-image-2.6-sunburst|2;nano-banana-pro|5",
         )
 
         return cls(
