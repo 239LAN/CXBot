@@ -236,7 +236,7 @@ class Config:
             client_secret=client_secret,
             token_url=_get("QQ_TOKEN_URL", "https://api.bot.qq.com/app/getAppAccessToken"),
             api_base=_get("QQ_API_BASE", "https://api.sgroup.qq.com").rstrip("/"),
-            intents=_get_int("QQ_INTENTS", 1 << 25),
+            intents=_get_int("QQ_INTENTS", (1 << 25) | (1 << 24)),
             deepseek_api_key=deepseek_api_key,
             deepseek_base_url=deepseek_base_url,
             deepseek_model=_get("DEEPSEEK_MODEL", "deepseek-flash"),

@@ -18,6 +18,9 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[MessageEvent], Awaitable[None]]
+# 群系统事件回调：(事件名, 事件体, 事件ID)
+RawEventHandler = Callable[[str, dict, str], Awaitable[None]]
+RawEventHandler = Callable[[str, dict], Awaitable[None]]
 
 # Gateway OpCode
 OP_DISPATCH = 0
@@ -29,6 +32,9 @@ OP_INVALID_SESSION = 9
 OP_HELLO = 10
 OP_HEARTBEAT_ACK = 11
 
+# 群系统事件：机器人入群、群成员加入
+GROUP_EVENT_TYPES = {"GROUP_ADD_ROBOT", "GROUP_MEMBER_ADD"}
+
 
 class GatewayClient:
     def __init__(
@@ -37,11 +43,13 @@ class GatewayClient:
         api: QQBotAPI,
         tokens: AccessTokenManager,
         on_message: EventHandler,
+        on_group_event: RawEventHandler | None = None,
     ) -> None:
         self._config = config
         self._api = api
         self._tokens = tokens
         self._on_message = on_message
+        self._on_group_event = on_group_event
         self._seq: int | None = None
         self._session_id: str | None = None
         self._running = False
@@ -198,6 +206,16 @@ class GatewayClient:
 
         if event_type == "RESUMED":
             logger.info("会话恢复完成")
+            return
+
+        if event_type in GROUP_EVENT_TYPES:
+            if self._on_group_event is None:
+                return
+            event_id = str(payload.get("id") or "")
+            try:
+                await self._on_group_event(event_type, data, event_id)
+            except Exception:
+                logger.exception("处理群事件失败：%s", event_type)
             return
 
         event = parse_message_event(event_type, data)

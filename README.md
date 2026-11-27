@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.11-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.12-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -37,6 +37,7 @@
 - 管理员名单：不限额度、不计费、工具轮数不限，输出上限 393216 tokens，上下文预算 1048576 tokens，空间上限 1GB
 - 重置码：一次性恢复自己的额度；管理员可在聊天中生成
 - 黑名单：管理员可拉黑用户，禁止其继续使用
+- 入群与新人欢迎：被拉进群时由 AI 写自我介绍与功能说明，新成员入群时由 AI 写欢迎语；使用事件被动回复（event_id）而非主动消息，默认关闭思考、输出上限 1024 tokens，读取群上下文但不写入，不扣积分
 - Minecraft Java 服务器状态探测：支持 `_minecraft._tcp` SRV 记录，显示延迟、版本、在线人数与 MOTD；AI 也可在用户询问时直接查服
 - AI 代办对话设置：用户明确要求时，AI 可修改过程显示、Markdown、思考强度与显示、流式输出、输出上限与上下文预算（群聊沿用群主/管理员权限）
 
@@ -137,6 +138,7 @@ Python 3.10+。图片处理依赖 Pillow（大图与非常规格式会转成 JPE
 | 变量 | 说明 |
 | --- | --- |
 | `QQ_APP_ID` / `QQ_CLIENT_SECRET` | QQ 机器人凭据 |
+| `QQ_INTENTS` | 事件订阅位，默认 `50331648`（群@消息与单聊消息 + 群成员事件）；入群/新人欢迎需要群成员事件权限 |
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
 | `DEEPSEEK_MODEL` | 模型名，默认 `deepseek-flash` |
 | `DEEPSEEK_THINKING` | 默认是否开启思考模式 |

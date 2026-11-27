@@ -112,7 +112,13 @@ async def run(config: Config) -> None:
             console=console,
             updater=updater,
         )
-        gateway = GatewayClient(config, api, tokens, handler.handle)
+        gateway = GatewayClient(
+            config,
+            api,
+            tokens,
+            handler.handle,
+            on_group_event=handler.handle_group_event,
+        )
 
         cleanup_task = asyncio.create_task(_cleanup_loop(workspace, admins))
         update_task = asyncio.create_task(updater.loop())

@@ -165,6 +165,7 @@ class QQBotAPI:
         msg_id: str | None = None,
         msg_seq: int = 1,
         markdown: bool = False,
+        event_id: str | None = None,
     ) -> dict:
         if markdown:
             payload: dict = {
@@ -176,6 +177,9 @@ class QQBotAPI:
         if msg_id:
             payload["msg_id"] = msg_id
             payload["msg_seq"] = msg_seq
+        elif event_id:
+            # 被动消息（响应事件）：携带事件 ID，避免走主动消息限额
+            payload["event_id"] = event_id
         return await self._request("POST", f"/v2/groups/{group_openid}/messages", payload)
 
     async def upload_c2c_file(

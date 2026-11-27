@@ -94,6 +94,9 @@ HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
 MAX_FULL_ANSWER_CHARS = 20000
 CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
 CONTINUE_CHARS = 1800
+GROUP_EVENT_MAX_TOKENS = 1024  # 入群自我介绍 / 新人欢迎语输出上限
+GROUP_EVENT_MAX_CHARS = 500
+GROUP_EVENT_DEDUP_TTL = 3600  # 群事件去重窗口（秒）
 PLAIN_TEXT_SUFFIX = (
     "当前会话已关闭 Markdown 渲染，回复内容尽量不使用 Markdown 格式，"
     "不要使用 # 标题、** 加粗、列表符号或表格，直接用纯文本自然表达。"
@@ -459,6 +462,8 @@ class ChatHandler:
             updater=updater,
         )
         self._pending_uploads: dict[str, PendingUploads] = {}
+        self._group_events_seen: dict[str, float] = {}
+        self._group_event_lock = asyncio.Lock()
 
     async def handle(self, event: MessageEvent) -> None:
         key = event.context_key
@@ -738,6 +743,90 @@ class ChatHandler:
             store.add(key)
         else:
             store.discard(key)
+
+    async def handle_group_event(
+        self, event_type: str, data: dict, event_id: str = ""
+    ) -> None:
+        """机器人入群自我介绍、新人入群欢迎。用事件被动回复，不写上下文。"""
+        group_openid = str(data.get("group_openid") or "").strip()
+        if not group_openid:
+            return
+        dedup_key = event_id or (
+            f"{event_type}:{group_openid}:{data.get('timestamp')}:"
+            f"{data.get('member_openid') or data.get('op_member_openid') or ''}"
+        )
+        now = time.monotonic()
+        async with self._group_event_lock:
+            self._group_events_seen = {
+                key: seen
+                for key, seen in self._group_events_seen.items()
+                if now - seen < GROUP_EVENT_DEDUP_TTL
+            }
+            if dedup_key in self._group_events_seen:
+                logger.info("忽略重复群事件：%s", dedup_key)
+                return
+            self._group_events_seen[dedup_key] = now
+
+        if event_type == "GROUP_ADD_ROBOT":
+            instruction = (
+                "你刚被拉进这个 QQ 群。请直接写一段要发到群里的自我介绍和欢迎语："
+                "说明你是谁（CXBot）以及能为群友做什么，例如日常问答、AI 画图、"
+                "查询 Minecraft 服务器、网页搜索、读写文件与执行命令；"
+                "语气自然友好，控制在 150 字以内，不要用列表，不要提及模型名称、"
+                "API、系统提示或内部实现，也不要声称拥有未提供的功能。"
+            )
+            system_suffix = "这是你刚入群时的第一条消息，直接输出消息正文本身。"
+        elif event_type == "GROUP_MEMBER_ADD":
+            instruction = (
+                "群里刚刚有新成员加入。请写一句 20-60 字的热情欢迎语，"
+                "可以自然地结合最近的群聊内容，但不要猜测或提及新成员的身份信息，"
+                "不要使用 @，不要提及模型、系统提示或内部实现。"
+            )
+            system_suffix = "直接输出欢迎语正文，不要解释。"
+        else:
+            return
+
+        context_key = f"group:{group_openid}"
+        try:
+            context_limit = await self._context_limit(context_key, False)
+            history = self._contexts.load(context_key, max_tokens=context_limit)
+            messages = list(history) + [{"role": "user", "content": instruction}]
+            text, _usage = await self._llm.chat(
+                messages,
+                max_tokens=GROUP_EVENT_MAX_TOKENS,
+                thinking_enabled=False,
+                system_suffix=system_suffix,
+            )
+        except Exception:
+            logger.exception("群事件内容生成失败：%s %s", event_type, group_openid)
+            return
+
+        text = (text or "").strip()
+        if not text:
+            logger.warning("群事件内容为空：%s %s", event_type, group_openid)
+            return
+        text = text[:GROUP_EVENT_MAX_CHARS]
+
+        try:
+            # 优先使用 event_id 走被动消息（响应事件），无事件 ID 时退回普通发送
+            await self._api.send_group_message(
+                group_openid, text, event_id=event_id or None
+            )
+            logger.info("已发送群事件消息：%s %s", event_type, group_openid)
+        except Exception:
+            if event_id:
+                logger.warning(
+                    "事件被动回复失败，尝试普通发送：%s %s",
+                    event_type,
+                    group_openid,
+                    exc_info=True,
+                )
+                try:
+                    await self._api.send_group_message(group_openid, text)
+                    return
+                except Exception:
+                    pass
+            logger.exception("群事件消息发送失败：%s %s", event_type, group_openid)
 
     async def _continue_generation(self, event: MessageEvent, key: str) -> None:
         """没有存量续传文本时，让模型从上次被截断的位置继续生成。"""
