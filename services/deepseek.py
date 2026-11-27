@@ -257,14 +257,20 @@ class DeepSeekClient:
                             continue
 
                         error = chunk.get("error")
-                        if isinstance(error, dict):
-                            message = str(error.get("message") or "")
+                        if error:
+                            message = (
+                                str(error.get("message") or error)
+                                if isinstance(error, dict)
+                                else str(error)
+                            )
+                            last_block = message
+                            logger.warning("上游流式返回错误：%s", message[:300])
                             if self._is_client_blocked(message):
-                                last_block = message
                                 if not yielded and attempt + 1 < attempts:
                                     retry = True
                                     break
                                 raise LLMError(f"DeepSeek 拒绝了当前客户端：{message}")
+                            raise LLMError(f"上游返回错误：{message[:300]}")
 
                         choices = chunk.get("choices") or []
                         usage = chunk.get("usage")
@@ -306,6 +312,24 @@ class DeepSeekClient:
                 continue
             if state is not None and tool_slots:
                 state.tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
+            if not yielded and not tool_slots:
+                finish = state.finish_reason if state is not None else ""
+                if (
+                    state is not None
+                    and state.reasoning_content
+                    and finish == "length"
+                ):
+                    raise LLMError("思考内容占满输出长度，未生成正文")
+                logger.warning(
+                    "上游返回空内容（finish_reason=%s），第 %d/%d 次尝试",
+                    finish or "无",
+                    attempt + 1,
+                    attempts,
+                )
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.6)
+                    continue
+                raise LLMError("上游返回空内容，请稍后重试")
             return
 
         raise LLMError(f"DeepSeek 拒绝了当前客户端：{last_block[:300]}")
