@@ -22,7 +22,7 @@ INCLUDE_FILES = (
     "README.md",
     "LICENSE",
 )
-INCLUDE_DIRS = ("bot", "services", "scripts")
+INCLUDE_DIRS = ("bot", "services", "scripts", "webapp")
 SKIP_RELATIVE = {"scripts/install.sh"}
 SKIP_PARTS = {"__pycache__"}
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,6 +13,18 @@ import aiohttp
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+CLIENT_BLOCK_HINTS = (
+    "本站仅限主流",
+    "当前客户端不支持",
+    "仅限主流 Coding",
+    "Coding 客户端",
+)
+_RETRY_USER_AGENTS: tuple[str | None, ...] = (
+    None,
+    "codex_cli_rs/0.20.0",
+    "claude-code/1.0.0",
+)
 
 
 class LLMError(RuntimeError):
@@ -87,11 +100,19 @@ class DeepSeekClient:
             payload["tools"] = tools
         return payload
 
-    def _headers(self) -> dict:
-        return {
+    @staticmethod
+    def _is_client_blocked(text: str) -> bool:
+        return any(hint in (text or "") for hint in CLIENT_BLOCK_HINTS)
+
+    def _headers(self, attempt: int = 0) -> dict:
+        headers = {
             "Authorization": f"Bearer {self._config.deepseek_api_key}",
             "Content-Type": "application/json",
         }
+        ua = _RETRY_USER_AGENTS[min(attempt, len(_RETRY_USER_AGENTS) - 1)]
+        if ua:
+            headers["User-Agent"] = ua
+        return headers
 
     @property
     def _url(self) -> str:
@@ -123,30 +144,56 @@ class DeepSeekClient:
             system_suffix=system_suffix,
         )
 
-        async with self._session.post(
-            self._url, json=payload, headers=self._headers(), timeout=self._timeout
-        ) as resp:
-            raw = await resp.text()
-            if resp.status != 200:
-                raise LLMError(f"DeepSeek 调用失败：HTTP {resp.status} {raw}")
+        async def _post(headers_attempt: int) -> tuple[int, str]:
+            async with self._session.post(
+                self._url,
+                json=payload,
+                headers=self._headers(headers_attempt),
+                timeout=self._timeout,
+            ) as resp:
+                return resp.status, await resp.text()
 
-        try:
-            data = json.loads(raw)
-            message = data["choices"][0]["message"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"DeepSeek 响应解析失败：{raw}") from exc
+        attempts = len(_RETRY_USER_AGENTS)
+        last_raw = ""
+        for attempt in range(attempts):
+            status, raw = await _post(attempt)
+            last_raw = raw
+            if status != 200:
+                if self._is_client_blocked(raw) and attempt + 1 < attempts:
+                    logger.warning("API 限制当前客户端，换用备用客户端标识重试")
+                    await asyncio.sleep(0.6)
+                    continue
+                raise LLMError(f"DeepSeek 调用失败：HTTP {status} {raw}")
 
-        content = message.get("content")
-        if not isinstance(content, str):
-            content = ""
-        if state is not None:
-            state.tool_calls = message.get("tool_calls") or []
-            state.reasoning_content = message.get("reasoning_content") or ""
-            state.finish_reason = data["choices"][0].get("finish_reason") or ""
-        if not content.strip() and not (state and state.tool_calls):
-            raise LLMError(f"DeepSeek 返回空内容：{raw}")
-        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        return content.strip(), usage
+            try:
+                data = json.loads(raw)
+                message = data["choices"][0]["message"]
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise LLMError(f"DeepSeek 响应解析失败：{raw}") from exc
+
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = ""
+            if self._is_client_blocked(content):
+                if attempt + 1 < attempts:
+                    logger.warning("API 返回客户端限制提示，换用备用客户端标识重试")
+                    await asyncio.sleep(0.6)
+                    continue
+                raise LLMError(f"DeepSeek 拒绝了当前客户端：{content[:300]}")
+            if state is not None:
+                state.tool_calls = message.get("tool_calls") or []
+                state.reasoning_content = (
+                    message.get("reasoning_content")
+                    or message.get("reasoning")
+                    or ""
+                )
+                state.finish_reason = data["choices"][0].get("finish_reason") or ""
+            if not content.strip() and not (state and state.tool_calls):
+                raise LLMError(f"DeepSeek 返回空内容：{raw}")
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            return content.strip(), usage
+
+        raise LLMError(f"DeepSeek 拒绝了当前客户端：{last_raw[:300]}")
 
     async def stream_chat(
         self,
@@ -173,59 +220,95 @@ class DeepSeekClient:
             reasoning_effort=reasoning_effort,
             system_suffix=system_suffix,
         )
-        tool_slots: dict[int, dict] = {}
+        attempts = len(_RETRY_USER_AGENTS)
+        last_block = ""
+        for attempt in range(attempts):
+            tool_slots: dict[int, dict] = {}
+            yielded = False
+            retry = False
 
-        async with self._session.post(
-            self._url, json=payload, headers=self._headers(), timeout=self._stream_timeout
-        ) as resp:
-            if resp.status != 200:
-                raw = await resp.text()
-                raise LLMError(f"DeepSeek 调用失败：HTTP {resp.status} {raw}")
+            async with self._session.post(
+                self._url,
+                json=payload,
+                headers=self._headers(attempt),
+                timeout=self._stream_timeout,
+            ) as resp:
+                if resp.status != 200:
+                    raw = await resp.text()
+                    last_block = raw
+                    if self._is_client_blocked(raw) and attempt + 1 < attempts:
+                        retry = True
+                    else:
+                        raise LLMError(f"DeepSeek 调用失败：HTTP {resp.status} {raw}")
+                else:
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if not line.startswith("data:"):
+                            continue
 
-            async for raw_line in resp.content:
-                line = raw_line.decode("utf-8", "ignore").strip()
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
+                        data = line[len("data:") :].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except ValueError:
+                            continue
 
-                data = line[len("data:") :].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
+                        error = chunk.get("error")
+                        if isinstance(error, dict):
+                            message = str(error.get("message") or "")
+                            if self._is_client_blocked(message):
+                                last_block = message
+                                if not yielded and attempt + 1 < attempts:
+                                    retry = True
+                                    break
+                                raise LLMError(f"DeepSeek 拒绝了当前客户端：{message}")
 
-                choices = chunk.get("choices") or []
-                usage = chunk.get("usage")
-                if state is not None and isinstance(usage, dict) and usage:
-                    state.usage = usage
-                if not choices:
-                    continue
-                choice = choices[0] if isinstance(choices[0], dict) else {}
-                finish = choice.get("finish_reason")
-                if state is not None and finish:
-                    state.finish_reason = finish
-                delta = choice.get("delta") or {}
+                        choices = chunk.get("choices") or []
+                        usage = chunk.get("usage")
+                        if state is not None and isinstance(usage, dict) and usage:
+                            state.usage = usage
+                        if not choices:
+                            continue
+                        choice = choices[0] if isinstance(choices[0], dict) else {}
+                        finish = choice.get("finish_reason")
+                        if state is not None and finish:
+                            state.finish_reason = finish
+                        delta = choice.get("delta") or {}
 
-                reasoning = delta.get("reasoning_content")
-                if reasoning:
-                    if state is not None:
-                        state.reasoning_content += reasoning
-                    if on_reasoning is not None:
-                        await on_reasoning(reasoning)
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning:
+                            if state is not None:
+                                state.reasoning_content += reasoning
+                            if on_reasoning is not None:
+                                await on_reasoning(reasoning)
 
-                if state is not None:
-                    for call in delta.get("tool_calls") or []:
-                        self._merge_tool_call(tool_slots, call)
+                        if state is not None:
+                            for call in delta.get("tool_calls") or []:
+                                self._merge_tool_call(tool_slots, call)
 
-                content = delta.get("content")
-                if content:
-                    yield content
+                        content = delta.get("content")
+                        if content and self._is_client_blocked(content):
+                            last_block = content
+                            if not yielded and attempt + 1 < attempts:
+                                retry = True
+                                break
+                            raise LLMError(f"DeepSeek 拒绝了当前客户端：{content[:300]}")
+                        if content:
+                            yielded = True
+                            yield content
 
-        if state is not None and tool_slots:
-            state.tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
+            if retry:
+                logger.warning("API 限制当前客户端，换用备用客户端标识重试")
+                await asyncio.sleep(0.6)
+                continue
+            if state is not None and tool_slots:
+                state.tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
+            return
+
+        raise LLMError(f"DeepSeek 拒绝了当前客户端：{last_block[:300]}")
 
     @staticmethod
     def _merge_tool_call(slots: dict[int, dict], call: dict) -> None:

@@ -83,7 +83,8 @@ HELP_TEXT = """可用指令：
 /gencode [数量] [天数] — 生成重置码
 /resetquota [群标识] — 直接重置群聊额度
 /block <用户标识> — 拉黑用户
-/unblock <用户标识> — 解除拉黑"""
+/unblock <用户标识> — 解除拉黑
+/console — 获取网页控制台验证码（30 秒刷新）"""
 
 
 class CommandRouter:

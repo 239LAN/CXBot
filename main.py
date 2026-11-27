@@ -16,6 +16,7 @@ from config import Config
 from services.admins import AdminStore
 from services.asr import ASRClient
 from services.blocklist import BlockStore
+from services.console import ManualConsole
 from services.context import ContextStore
 from services.deepseek import DeepSeekClient
 from services.preferences import PreferenceStore
@@ -76,6 +77,18 @@ async def run(config: Config) -> None:
         )
         asr = ASRClient(config, session)
 
+        console = None
+        if config.console_enabled:
+            console = ManualConsole(
+                api,
+                config.console_file,
+                history=config.console_history,
+                max_chars=config.max_reply_chars,
+                host=config.console_host,
+                port=config.console_port,
+                session_hours=config.console_session_hours,
+            )
+
         handler = ChatHandler(
             config,
             api,
@@ -89,10 +102,17 @@ async def run(config: Config) -> None:
             web,
             asr,
             blocks,
+            console=console,
         )
         gateway = GatewayClient(config, api, tokens, handler.handle)
 
         cleanup_task = asyncio.create_task(_cleanup_loop(workspace, admins))
+
+        if console is not None:
+            try:
+                await console.start()
+            except Exception:
+                logger.exception("网页控制台启动失败，机器人继续运行")
 
         logger.info("CXBot v%s 启动，AppID=%s", __version__, config.app_id)
         try:
@@ -103,6 +123,8 @@ async def run(config: Config) -> None:
                 await cleanup_task
             except asyncio.CancelledError:
                 pass
+            if console is not None:
+                await console.stop()
             gateway.stop()
 
 

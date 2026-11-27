@@ -149,6 +149,49 @@ def split_markdown(text: str, limit: int) -> tuple[str, str]:
     return text[:cut], text[cut:]
 
 
+def _table_header_before(text: str) -> str:
+    """prefix 末尾停在表格中时返回该表格的表头（两行），否则返回空串。"""
+    stripped = (text or "").rstrip("\n")
+    if not stripped:
+        return ""
+    last_line = stripped.split("\n")[-1]
+    if not _is_table_line(last_line):
+        return ""
+    last_start = stripped.rfind("\n", 0, len(stripped) - len(last_line)) + 1
+    start = last_start
+    while start > 0:
+        prev_end = start - 1
+        prev_start = stripped.rfind("\n", 0, prev_end) + 1
+        if not _is_table_line(stripped[prev_start:prev_end]):
+            break
+        start = prev_start
+    return _table_header(stripped, start)
+
+
+def tail_after(prefix: str, rest: str) -> str:
+    """按已发送的 prefix 修正后续正文，保证单独发出时结构完整。
+
+    已下发的流式正文不可修改，因此续传内容：
+    - 若 prefix 停在围栏代码块内，先补同语言开始围栏
+    - 若 prefix 停在表格内，先补表头与分隔行
+    """
+    rest = rest or ""
+    if not rest:
+        return ""
+    state = fence_state(prefix)
+    if state.open:
+        opened = (
+            f"{state.marker}{state.info}\n" if state.info else f"{state.marker}\n"
+        )
+        return f"{opened}{rest}"
+    first_line = rest.split("\n", 1)[0]
+    if _is_table_line(first_line):
+        header = _table_header_before(prefix)
+        if header and not rest.startswith(header):
+            return f"{header}{rest}"
+    return rest
+
+
 def split_markdown_chunks(text: str, limit: int, max_chunks: int = 5) -> list[str]:
     """把文本切成若干段，每段围栏代码块都保持闭合。"""
     text = (text or "").strip()

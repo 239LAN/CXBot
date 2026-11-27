@@ -38,11 +38,12 @@ from config import Config
 from services.admins import AdminStore
 from services.asr import ASRClient, ASRError
 from services.blocklist import BlockStore
+from services.console import ManualConsole
 from services.context import ContextStore
-from services.continuation import ContinuationStore, split_at_limit
+from services.continuation import ContinuationStore
 from services.deepseek import DeepSeekClient, LLMError, StreamState
 from services.documents import DocumentError, extract_text
-from services.markdown import close_fences, split_markdown, split_markdown_chunks
+from services.markdown import close_fences, split_markdown_chunks, tail_after
 from services.preferences import PreferenceStore
 from services.quota import QuotaManager
 from services.reset_codes import ResetCodeStore
@@ -76,6 +77,10 @@ CHUNK_INTERVAL = 0.25
 
 STREAM_FLUSH_INTERVAL = 0.6  # 秒，避免每来一个 token 都调一次接口
 STREAM_MAX_CHARS = 2000
+STREAM_SAFE_CHARS = 1900  # 给 QQ 端与 Markdown 围栏留安全余量
+# 流式消息首帧固定发送零宽空格：QQ 要求已下发内容前缀不可修改（40111001），
+# 后续所有分片都必须是「STREAM_PREFIX + 已累积正文」的严格追加。
+STREAM_PREFIX = "\u200b"
 MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS_PER_ROUND = 8
 MAX_C2C_PASSIVE_REPLIES = 4  # 单聊同一条消息最多回复 4 次（含流式消息）
@@ -83,7 +88,6 @@ DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 超过后走分片上传
 PENDING_UPLOAD_TTL = 600  # 只发附件后，等待提示词的最长时间（秒）
 MAX_PENDING_ATTACHMENTS = 10
 MAX_PROGRESS_CHARS = 400
-REASONING_PREVIEW_CHARS = 180  # 思考显示只取最近一段，避免挤占正文
 HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
 MAX_FULL_ANSWER_CHARS = 20000
 CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
@@ -196,6 +200,11 @@ class ProgressTracker:
         """记录上一次工具调用的结果摘要（仅在完整档位展示）。"""
         if self._last is not None and result:
             self._last.result = _short(result, 120)
+
+    @property
+    def last_label(self) -> str:
+        """最近一次工具调用的简短描述。"""
+        return self._last.label if self._last is not None else ""
 
     @staticmethod
     def _render_items(
@@ -345,6 +354,7 @@ class ChatHandler:
         web: WebTools,
         asr: ASRClient,
         blocks: BlockStore | None = None,
+        console: ManualConsole | None = None,
     ) -> None:
         self._config = config
         self._api = api
@@ -358,7 +368,9 @@ class ChatHandler:
         self._web = web
         self._asr = asr
         self._blocks = blocks or BlockStore(config.block_file)
+        self._console = console
         self._continuations = ContinuationStore()
+        self._needs_continue: set[str] = set()
         self._commands = CommandRouter(
             config,
             quota,
@@ -384,12 +396,18 @@ class ChatHandler:
 
         if text.lower() in ("/continue", "/继续"):
             # 预留一条消息给“继续”提示，避免分条发送时提示被截断
-            chunk_limit = min(
-                CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3)
+            chunk_limit = max(
+                200,
+                min(CONTINUE_CHARS, max(200, self._config.max_reply_chars * 3))
+                - len(CONTINUE_HINT)
+                - 16,
             )
             markdown_on = await self._preferences.get(key, "markdown") != "off"
             item = self._continuations.take(key, chunk_limit, markdown=markdown_on)
             if item is None:
+                if key in getattr(self, "_needs_continue", set()):
+                    await self._continue_generation(event, key)
+                    return
                 await self._reply(
                     event, "没有需要继续的内容，或已超过 1 小时。"
                 )
@@ -403,12 +421,23 @@ class ChatHandler:
             self._contexts.reset(key)
             self._pending_uploads.pop(key, None)
             self._continuations.clear(key)
+            self._mark_needs_continue(key, False)
             logger.info("清空上下文：%s", key)
             await self._reply(event, "上下文已清空，我们重新开始吧。")
             return
 
         if text.startswith("/"):
             command = text.split()[0].lower()
+            console = getattr(self, "_console", None)
+            if command in ("/console", "/控制台", "/验证码"):
+                if console is None:
+                    reply = "网页控制台未启用（CONSOLE_ENABLED=off）。"
+                elif not self._admins.is_admin(event.user_openid):
+                    reply = "仅 Bot 管理员可以获取网页控制台验证码。"
+                else:
+                    reply = console.code_text()
+                await self._reply(event, reply)
+                return
             # 群@消息不保证带 member_role，改设置前补查一次群成员角色
             if (
                 event.kind == "group"
@@ -420,6 +449,13 @@ class ChatHandler:
                 )
             reply = await self._commands.route(event, text)
             await self._reply(event, reply)
+            return
+
+        console = getattr(self, "_console", None)
+        self._mark_needs_continue(key, False)
+        if console is not None and await console.submit(event):
+            # 人工接管：消息已进入网页控制台，等待人工回复
+            logger.info("会话处于人工接管，跳过 AI 回复：%s", key)
             return
 
         if not text and (event.image_attachments or event.document_attachments):
@@ -516,21 +552,25 @@ class ChatHandler:
             )
             if stream_off:
                 # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
-                await self._text_reply(
-                    event,
-                    messages,
-                    key,
-                    remaining,
-                    thinking_enabled,
-                    reasoning_effort,
-                    history_text,
-                    tools=c2c_tools,
-                    reply_seq={"next": 1, "reserve": 1},
-                    unlimited=unlimited,
-                    output_limit=output_limit,
-                    context_tokens=context_limit,
-                    markdown=markdown_on,
-                )
+                try:
+                    await self._text_reply(
+                        event,
+                        messages,
+                        key,
+                        remaining,
+                        thinking_enabled,
+                        reasoning_effort,
+                        history_text,
+                        tools=c2c_tools,
+                        reply_seq={"next": 1, "reserve": 1},
+                        unlimited=unlimited,
+                        output_limit=output_limit,
+                        context_tokens=context_limit,
+                        markdown=markdown_on,
+                    )
+                finally:
+                    if console is not None:
+                        await console.clear_live(key)
                 return
             try:
                 answer, ok = await self._stream_reply(
@@ -564,6 +604,9 @@ class ChatHandler:
                     markdown=markdown_on,
                 )
                 return
+            finally:
+                if console is not None:
+                    await console.clear_live(key)
             if ok and answer:
                 self._contexts.append_turn(
                     key, history_text, answer, max_tokens=context_limit
@@ -576,20 +619,137 @@ class ChatHandler:
             + self._web.schemas()
             + [SAVE_ATTACHMENT_SCHEMA]
         )
-        await self._text_reply(
-            event,
-            messages,
-            key,
-            remaining,
-            thinking_enabled,
-            reasoning_effort,
-            history_text,
-            tools=group_tools,
-            unlimited=unlimited,
-            output_limit=output_limit,
-            context_tokens=context_limit,
-            markdown=markdown_on,
+        try:
+            await self._text_reply(
+                event,
+                messages,
+                key,
+                remaining,
+                thinking_enabled,
+                reasoning_effort,
+                history_text,
+                tools=group_tools,
+                unlimited=unlimited,
+                output_limit=output_limit,
+                context_tokens=context_limit,
+                markdown=markdown_on,
+            )
+        finally:
+            if console is not None:
+                await console.clear_live(key)
+
+    def _mark_needs_continue(self, key: str, needed: bool) -> None:
+        store = getattr(self, "_needs_continue", None)
+        if store is None:
+            store = set()
+            self._needs_continue = store
+        if needed:
+            store.add(key)
+        else:
+            store.discard(key)
+
+    async def _continue_generation(self, event: MessageEvent, key: str) -> None:
+        """没有存量续传文本时，让模型从上次被截断的位置继续生成。"""
+        unlimited = self._admins.is_admin(event.user_openid)
+        if unlimited:
+            remaining = await self._output_limit(key)
+        else:
+            remaining, reason = await self._quota.check(key)
+            if reason:
+                await self._reply(event, reason)
+                return
+            remaining = min(remaining, await self._output_limit(key))
+        context_limit = await self._context_limit(key, unlimited)
+        history = self._contexts.load(key, max_tokens=context_limit)
+        if not history:
+            self._mark_needs_continue(key, False)
+            await self._reply(event, "没有可以继续的内容。")
+            return
+
+        prompt = (
+            "请从你上一条回复被截断的位置继续写，不要重复已发送的内容，"
+            "也不要重新开头。"
         )
+        messages = history + [{"role": "user", "content": prompt}]
+        thinking = await self._preferences.get(key, "thinking")
+        thinking_enabled, reasoning_effort = self._thinking_params(thinking)
+        progress_mode = self._progress_mode(
+            await self._preferences.get(key, "progress")
+        )
+        thinking_display = await self._preferences.get(key, "reasoning") == "on"
+        markdown_on = await self._preferences.get(key, "markdown") != "off"
+        self._mark_needs_continue(key, False)
+        console = getattr(self, "_console", None)
+
+        if event.kind == "c2c":
+            tools = (
+                self._workspace.schemas()
+                + self._web.schemas()
+                + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+            )
+            try:
+                answer, ok = await self._stream_reply(
+                    event,
+                    messages,
+                    remaining,
+                    thinking_enabled,
+                    reasoning_effort,
+                    unlimited=unlimited,
+                    output_limit=remaining,
+                    context_tokens=context_limit,
+                    progress_mode=progress_mode,
+                    thinking_display=thinking_display,
+                    markdown_enabled=markdown_on,
+                )
+            except QQBotAPIError:
+                await self._text_reply(
+                    event,
+                    messages,
+                    key,
+                    remaining,
+                    thinking_enabled,
+                    reasoning_effort,
+                    "（继续）",
+                    tools=tools,
+                    reply_seq={"next": 1, "reserve": 1},
+                    unlimited=unlimited,
+                    output_limit=remaining,
+                    context_tokens=context_limit,
+                    markdown=markdown_on,
+                )
+                return
+            finally:
+                if console is not None:
+                    await console.clear_live(key)
+            if ok and answer:
+                self._contexts.append_turn(
+                    key, "（继续）", answer, max_tokens=context_limit
+                )
+            return
+
+        group_tools = (
+            self._workspace.schemas()
+            + self._web.schemas()
+            + [SAVE_ATTACHMENT_SCHEMA]
+        )
+        try:
+            await self._text_reply(
+                event,
+                messages,
+                key,
+                remaining,
+                thinking_enabled,
+                reasoning_effort,
+                "（继续）",
+                tools=group_tools,
+                unlimited=unlimited,
+                output_limit=remaining,
+                context_tokens=context_limit,
+                markdown=markdown_on,
+            )
+        finally:
+            if console is not None:
+                await console.clear_live(key)
 
     async def _download_attachment(
         self, url: str, max_bytes: int
@@ -922,55 +1082,53 @@ class ChatHandler:
         content_type = "markdown" if markdown_enabled else "text"
         system_suffix = "" if markdown_enabled else PLAIN_TEXT_SUFFIX
 
-        reserve = len(CONTINUE_HINT) + 8
-        if progress_mode != "off":
-            reserve += MAX_PROGRESS_CHARS
-        if thinking_display:
-            reserve += REASONING_PREVIEW_CHARS + 16
-        answer_limit = max(300, STREAM_MAX_CHARS - reserve)
+        # 流式正文严格追加：首帧固定 STREAM_PREFIX，之后只增不减。
+        # 任何“替换已下发前缀”的写法都会触发 QQ 40111001。
+        body_limit = max(300, STREAM_SAFE_CHARS - len(CONTINUE_HINT) - 16)
         progress = (
             None
             if progress_mode == "off"
             else ProgressTracker(show_result=progress_mode == "full")
         )
-        reasoning_text = ""
-
         full_answer = ""
         answer = ""
+        body = ""
         started = False
         stream_broken = False
         stream_msg_id = ""
         index = 0
         last_flush = 0.0
-        last_sent_answer_len = 0
-        last_sent_display = ""
+        last_sent_body = ""
         llm_failed = False
         rounds_exhausted = False
         output_cut = False
         push_lock = asyncio.Lock()
 
-        def display_content() -> str:
-            blocks: list[str] = []
-            if progress:
-                note = progress.render()
-                if note:
-                    blocks.append(note)
-            thought = reasoning_block()
-            if thought:
-                blocks.append(thought)
-            if answer:
-                blocks.append(close_fences(answer) if markdown_enabled else answer)
-            return "\n\n".join(blocks)
+        reasoning_text = ""
+        console = getattr(self, "_console", None)
+        live_at = 0.0
+        live_lock = asyncio.Lock()
 
-        def reasoning_block() -> str:
-            if not thinking_display:
-                return ""
-            text = reasoning_text.strip()
+        async def publish_live(kind: str, text: str, force: bool = False) -> None:
+            nonlocal live_at
+            if console is None:
+                return
+            now = time.monotonic()
+            async with live_lock:
+                if not force and now - live_at < 0.8:
+                    return
+                live_at = now
+            await console.publish(event.context_key, kind, text)
+
+        def append_body(text: str, limit: int | None = None) -> None:
+            """向流式正文追加内容，只追加不修改，超过安全上限后丢弃。"""
+            nonlocal body
             if not text:
-                return ""
-            if len(text) > REASONING_PREVIEW_CHARS:
-                text = "…" + text[-(REASONING_PREVIEW_CHARS - 1) :]
-            return f"【思考】\n{text}"
+                return
+            cap = body_limit if limit is None else limit
+            room = cap - len(body)
+            if room > 0:
+                body += text[:room]
 
         async def push(content: str) -> None:
             nonlocal started, stream_msg_id, index, last_flush
@@ -997,26 +1155,19 @@ class ChatHandler:
                 last_flush = time.monotonic()
 
         async def flush(force: bool = False) -> None:
-            nonlocal stream_broken, last_sent_display, last_sent_answer_len
+            nonlocal stream_broken, last_sent_body
             if stream_broken:
                 return
-            content = display_content()
-            if not content:
-                return
-            now = time.monotonic()
-            if not started or force:
-                should_send = True
-            else:
-                should_send = (
-                    now - last_flush >= STREAM_FLUSH_INTERVAL
-                    and content != last_sent_display
-                )
-            if not should_send:
-                return
+            if started and not force:
+                if body == last_sent_body:
+                    return
+                if time.monotonic() - last_flush < STREAM_FLUSH_INTERVAL:
+                    return
             try:
-                await push(content)
-                last_sent_display = content
-                last_sent_answer_len = len(answer)
+                await push(STREAM_PREFIX + body)
+                last_sent_body = body
+                if answer:
+                    await publish_live("answer", answer[-200:])
             except QQBotAPIError:
                 stream_broken = True
                 logger.exception("流式分片发送失败：%s", event.user_openid)
@@ -1025,7 +1176,7 @@ class ChatHandler:
             nonlocal reasoning_text
             if len(reasoning_text) < 4000:
                 reasoning_text += chunk
-            await flush()
+            await publish_live("thinking", reasoning_text[-200:])
 
         async def run_tool_with_heartbeat(coro) -> str:
             task = asyncio.create_task(coro)
@@ -1042,16 +1193,10 @@ class ChatHandler:
             nonlocal stream_broken
             if stream_broken:
                 return
-            if not started:
-                try:
-                    await push("\u200b")
-                except QQBotAPIError:
-                    stream_broken = True
-                    logger.exception("流式消息建立失败：%s", event.user_openid)
-                    return
             await flush(force=True)
 
-        # 先建立流式消息，避免模型思考期间连接空闲
+        # 先建立流式消息：首帧只发零宽前缀，保证后续追加的前缀永远一致
+        await publish_live("thinking", "AI 正在思考…", True)
         await keep_alive()
 
         round_limit = self._round_limit(unlimited)
@@ -1072,13 +1217,26 @@ class ChatHandler:
                         on_reasoning=on_reasoning if thinking_display else None,
                     )
                 ) as stream:
-                    async for delta in stream:
+                    iterator = stream.__aiter__()
+                    while True:
+                        try:
+                            delta = await asyncio.wait_for(
+                                anext(iterator), timeout=HEARTBEAT_INTERVAL
+                            )
+                        except asyncio.TimeoutError:
+                            # 模型长时间没有增量时也保持连接并更新“思考中”
+                            await keep_alive()
+                            continue
+                        except StopAsyncIteration:
+                            break
                         if len(full_answer) < MAX_FULL_ANSWER_CHARS:
                             full_answer += delta
                         if len(round_text) < MAX_FULL_ANSWER_CHARS:
                             round_text += delta
-                        if len(answer) < answer_limit:
-                            answer += delta[: answer_limit - len(answer)]
+                        chunk = delta[: max(0, body_limit - len(body))]
+                        if chunk:
+                            answer += chunk
+                            append_body(chunk)
                         await flush()
             except LLMError:
                 llm_failed = True
@@ -1134,6 +1292,12 @@ class ChatHandler:
                 logger.info("调用工具 %s：%s", tool_name, arguments[:200])
                 if progress is not None:
                     progress.record(tool_name, arguments)
+                    await publish_live("tool", progress.render(), True)
+                    label = progress.last_label
+                    if label:
+                        # 过程信息只能追加在已下发内容之后，不能改写前缀
+                        sep = "" if not body or body.endswith("\n") else "\n"
+                        append_body(f"{sep}【{_short(label, 60)}】\n")
                     await flush(force=True)
                 result = await run_tool_with_heartbeat(
                     self._run_tool(
@@ -1142,7 +1306,7 @@ class ChatHandler:
                 )
                 if progress is not None and progress.show_result:
                     progress.add_result(result)
-                    await flush(force=True)
+                    await publish_live("tool", progress.render(), True)
                 working.append(
                     {
                         "role": "tool",
@@ -1157,45 +1321,46 @@ class ChatHandler:
             if not answer:
                 llm_failed = True
 
-        if markdown_enabled:
-            first, rest = split_markdown(full_answer, answer_limit)
-        else:
-            first, rest = split_at_limit(full_answer, answer_limit)
-        if rest:
-            self._continuations.put(event.context_key, rest)
-            answer = first + CONTINUE_HINT
-        else:
-            answer = first
-            if output_cut and answer and not answer.endswith(
-                ("……", "。", "！", "？", "!", "?")
-            ):
-                answer += "……"
-        if markdown_enabled:
-            answer = close_fences(answer)
+        # 已下发内容不可修改：剩余内容按实际已发送长度（len(answer)）裁剪，
+        # 并自动重开代码围栏、补表格表头，保证 /继续 单独发出时结构完整。
+        rest_text = full_answer[len(answer):] if full_answer.startswith(answer) else ""
+        if rest_text:
+            if markdown_enabled:
+                rest_text = tail_after(answer, rest_text)
+            self._continuations.put(event.context_key, rest_text)
+            self._mark_needs_continue(event.context_key, False)
+            append_body(CONTINUE_HINT, STREAM_SAFE_CHARS)
+        elif output_cut:
+            self._mark_needs_continue(event.context_key, True)
+            if answer and not answer.endswith(("……", "。", "！", "？", "!", "?")):
+                append_body("……", STREAM_SAFE_CHARS)
+        if markdown_enabled and body:
+            # 补齐末尾未闭合的围栏代码块（只追加，不改动已发内容）
+            closing = close_fences(body)[len(body):]
+            append_body(closing, STREAM_SAFE_CHARS)
 
-        final_display = display_content()
-        if not final_display:
-            final_display = FALLBACK_REPLY
+        if not body:
+            append_body(FALLBACK_REPLY, STREAM_SAFE_CHARS)
             llm_failed = True
+        final_display = STREAM_PREFIX + body
 
         if started:
             try:
                 await self._api.stream_c2c_message(
                     event.user_openid,
-                    final_display,
+                    STREAM_PREFIX + body,
                     input_state=10,
                     index=index,
                     stream_msg_id=stream_msg_id,
                     msg_id=event.msg_id,
                     content_type=content_type,
                 )
+                console = getattr(self, "_console", None)
+                if console is not None:
+                    await console.record_outbound(event, full_answer, replies=1)
             except QQBotAPIError:
                 logger.exception("结束流式消息失败，回退普通消息：%s", event.user_openid)
-                tail = (
-                    answer[last_sent_answer_len:]
-                    if last_sent_answer_len < len(answer)
-                    else ""
-                )
+                tail = body[len(last_sent_body):] if len(last_sent_body) < len(body) else ""
                 if tail:
                     await self._reply(
                         event,
@@ -1539,6 +1704,9 @@ class ChatHandler:
     ) -> None:
         """群聊与流式兜底：非流式回复，支持网页搜索/抓取工具。"""
         working = list(messages)
+        console = getattr(self, "_console", None)
+        if console is not None:
+            await console.publish(event.context_key, "thinking", "AI 正在思考…")
         limit = output_limit or self._admin_output_tokens()
         tool_schemas = self._web.schemas() if tools is None else tools
         system_suffix = "" if markdown else PLAIN_TEXT_SUFFIX
@@ -1565,10 +1733,12 @@ class ChatHandler:
 
             await self._charge_usage(key, usage, unlimited=unlimited)
             if not state.tool_calls:
-                if state.finish_reason == "length" and answer and not answer.endswith(
-                    ("…", "。", "！", "？", "!", "?")
-                ):
-                    answer += "…"
+                if state.finish_reason == "length":
+                    self._mark_needs_continue(key, True)
+                    if answer and not answer.endswith(
+                        ("…", "。", "！", "？", "!", "?")
+                    ):
+                        answer += "…"
                 break
 
             if unlimited:
@@ -1692,3 +1862,7 @@ class ChatHandler:
 
             if offset < len(chunks) - 1:
                 await asyncio.sleep(CHUNK_INTERVAL)
+
+        console = getattr(self, "_console", None)
+        if console is not None:
+            await console.record_outbound(event, text, replies=len(chunks))

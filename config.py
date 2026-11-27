@@ -131,6 +131,13 @@ class Config:
     log_level: str
     request_timeout: float
 
+    console_enabled: bool
+    console_host: str
+    console_port: int
+    console_file: Path
+    console_history: int
+    console_session_hours: float
+
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv(BASE_DIR / ".env")
@@ -256,4 +263,12 @@ class Config:
             max_reply_chars=max(50, _get_int("MAX_REPLY_CHARS", 500)),
             log_level=_get("LOG_LEVEL", "INFO").upper(),
             request_timeout=_get_float("REQUEST_TIMEOUT", 15.0),
+            console_enabled=_get_bool("CONSOLE_ENABLED", True),
+            console_host=_get("CONSOLE_HOST", "0.0.0.0"),
+            console_port=max(1, min(65535, _get_int("CONSOLE_PORT", 8080))),
+            console_file=Path(_get("CONSOLE_FILE") or DATA_DIR / "console.json"),
+            console_history=max(20, _get_int("CONSOLE_HISTORY", 200)),
+            console_session_hours=max(
+                0.1, _get_float("CONSOLE_SESSION_HOURS", 12.0)
+            ),
         )
