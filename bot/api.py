@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def _lead_newline(text: str) -> str:
-    """所有发出的文本消息统一以换行开头。"""
+    """群聊文本消息统一以换行开头（私聊保持原样）。"""
     if not text or text.startswith("\n"):
         return text
     return "\n" + text
@@ -124,7 +124,6 @@ class QQBotAPI:
         msg_seq: int = 1,
         markdown: bool = False,
     ) -> dict:
-        content = _lead_newline(content)
         if markdown:
             payload: dict = {
                 "msg_type": 2,

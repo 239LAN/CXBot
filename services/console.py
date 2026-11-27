@@ -394,6 +394,9 @@ class ManualConsole:
             Path(file_name).suffix.lower() in IMAGE_SUFFIXES
         )
         file_type = 1 if is_image else 4
+        if kind == "group" and len(data) > DIRECT_UPLOAD_MAX_BYTES:
+            # 先校验再发附带文字，避免文字已发出但文件失败
+            return "群聊暂不支持发送超过 5MB 的文件"
 
         try:
             if caption:
@@ -416,8 +419,6 @@ class ManualConsole:
                 seq += 1
 
             if kind == "group":
-                if len(data) > DIRECT_UPLOAD_MAX_BYTES:
-                    return "群聊暂不支持发送超过 5MB 的文件"
                 file_info = await self._api.upload_group_file(
                     last.get("group_openid") or "",
                     file_name=file_name,
@@ -582,8 +583,11 @@ class ManualConsole:
 
     async def _api_logout(self, request: web.Request) -> web.Response:
         token = request.cookies.get(COOKIE_NAME) or ""
+        was_authed = token in self._tokens
         self._tokens.pop(token, None)
-        await self.release_all()
+        if was_authed:
+            # 只有已登录会话主动退出才解除接管，避免未授权请求误清状态
+            await self.release_all()
         response = web.json_response({"ok": True})
         response.del_cookie(COOKIE_NAME, path="/")
         return response

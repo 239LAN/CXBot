@@ -144,6 +144,7 @@ async def run(config: Config) -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
+            await handler.shutdown()
             if console is not None:
                 await console.stop()
             gateway.stop()

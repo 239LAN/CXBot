@@ -209,7 +209,7 @@ class GatewayClient:
             return
 
         if event_type in GROUP_EVENT_TYPES:
-            if self._on_group_event is None:
+            if self._on_group_event is None or not isinstance(data, dict):
                 return
             event_id = str(payload.get("id") or "")
             try:
