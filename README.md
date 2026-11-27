@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.7-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.8-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -20,7 +20,7 @@
   - 群聊同样开放文件空间与沙箱命令，按群共享
 - 流式过程显示：三档可调（不显示 / 命令与工具调用 / 含输出与结果），默认不显示，`/progress` 切换；开启后工具摘要按发生顺序追加在正文之后
 - 流式正文严格追加：首帧固定零宽空格，之后只追加不替换已下发内容，避免 QQ 40111001
-- 思考内容显示：可开关，开启后思考过程实时推送到网页控制台，不写入 QQ 消息正文，`/thinking show on|off`
+- 思考内容显示：私聊可开关，开启后以 `[正在深度思考]` 开头、`[已思考(用时 n 秒)]` 结尾，中间最多展示 800 字思考内容，之后接正式回答；同时推送到网页控制台，`/thinking show on|off`
 - 输出长度与上下文预算：`/length`、`/context` 按 token 设置，普通用户上限不超过管理员
 - 群聊设置权限：只有群主、群管理员或 Bot 管理员可以修改本群设置
 - 长回复截断续传：超出单条上限时先发 `……` 与 `发送[/继续]继续`，1 小时内可继续

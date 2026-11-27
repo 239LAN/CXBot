@@ -89,6 +89,7 @@ DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 超过后走分片上传
 PENDING_UPLOAD_TTL = 600  # 只发附件后，等待提示词的最长时间（秒）
 MAX_PENDING_ATTACHMENTS = 10
 MAX_PROGRESS_CHARS = 400
+THINKING_STREAM_CHARS = 800  # 私聊开启思考显示时，最多把多少字追加到流式正文
 HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
 MAX_FULL_ANSWER_CHARS = 20000
 CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
@@ -219,17 +220,17 @@ class ProgressTracker:
     def render(self) -> str:
         lines: list[str] = []
         if self.reads:
-            lines.append(f"【阅读了{len(self.reads)}个文件】")
+            lines.append(f"[阅读了{len(self.reads)}个文件]")
             self._render_items(lines, self.reads, 3, self.show_result)
         if self.commands:
-            lines.append(f"【执行了{len(self.commands)}条命令】")
+            lines.append(f"[执行了{len(self.commands)}条命令]")
             self._render_items(lines, self.commands, 3, self.show_result)
         if self.writes:
-            lines.append(f"【修改了{len(self.writes)}个文件】")
+            lines.append(f"[修改了{len(self.writes)}个文件]")
             if self.show_result:
                 self._render_items(lines, self.writes, 3, True)
         for item in self.others[-5:]:
-            lines.append(f"【{item.label}】")
+            lines.append(f"[{item.label}]")
             if self.show_result and item.result:
                 lines.append(f"↳ {item.result}")
         text = "\n".join(lines)
@@ -318,7 +319,7 @@ SAVE_ATTACHMENT_SCHEMA = {
         "name": "save_attachment",
         "description": (
             "把当前可处理附件（文档、图片、语音等，含刚上传的附件）下载到私有空间。"
-            "index 从 1 开始，对应提示中的【可处理附件】列表；"
+            "index 从 1 开始，对应提示中的[可处理附件]列表；"
             "path 省略时使用原文件名，overwrite=true 可覆盖同名文件。"
         ),
         "parameters": {
@@ -389,6 +390,13 @@ class ChatHandler:
         key = event.context_key
         text = event.content
 
+        logger.info(
+            "收到消息 %s %s：%s",
+            event.kind,
+            key,
+            (text or "[非文本]").replace("\n", " ")[:300],
+        )
+
         # 不串行化整个处理流程：沙箱任务由自身并发槽位排队，
         # 一个耗时任务不会阻塞其他消息的回复。
         if self._blocks.is_blocked(event.user_openid) and not self._admins.is_admin(
@@ -408,7 +416,11 @@ class ChatHandler:
             markdown_on = await self._preferences.get(key, "markdown") != "off"
             item = self._continuations.take(key, chunk_limit, markdown=markdown_on)
             if item is None:
-                if key in getattr(self, "_needs_continue", set()):
+                needs = key in getattr(self, "_needs_continue", set())
+                logger.info(
+                    "继续请求：无续传文本，needs_continue=%s", needs
+                )
+                if needs:
                     await self._continue_generation(event, key)
                     return
                 await self._reply(
@@ -656,6 +668,7 @@ class ChatHandler:
 
     async def _continue_generation(self, event: MessageEvent, key: str) -> None:
         """没有存量续传文本时，让模型从上次被截断的位置继续生成。"""
+        logger.info("继续生成：%s", event.context_key)
         unlimited = self._admins.is_admin(event.user_openid)
         if unlimited:
             remaining = await self._output_limit(key)
@@ -852,7 +865,7 @@ class ChatHandler:
                 continue
             if len(text) > remaining:
                 text = text[:remaining].rstrip() + "\n…（文档内容已截断）"
-            blocks.append(f"【文档：{filename}】\n{text}")
+            blocks.append(f"[文档：{filename}]\n{text}")
             remaining -= len(text)
             if remaining <= 0:
                 break
@@ -924,7 +937,7 @@ class ChatHandler:
         """只发文件/图片时先提示上传成功，内容暂存到下一次提示词。"""
         count = len(event.image_attachments) + len(event.document_attachments)
         await self._reply(
-            event, f"【{count}个文件上传成功，请继续上传或发送提示词】"
+            event, f"[{count}个文件上传成功，请继续上传或发送提示词]"
         )
 
         images = await self._load_images(event)
@@ -1015,7 +1028,7 @@ class ChatHandler:
     def _attachment_note(event: MessageEvent) -> str:
         if not event.attachments:
             return ""
-        lines = ["【可处理附件】"]
+        lines = ["[可处理附件]"]
         for index, item in enumerate(event.attachments[:10], 1):
             name = Path(str(item.get("filename") or "")).name
             if not name:
@@ -1114,6 +1127,10 @@ class ChatHandler:
         push_lock = asyncio.Lock()
 
         reasoning_text = ""
+        thinking_chars = 0
+        thinking_header = False
+        thinking_started_at = 0.0
+        in_thinking = False
         console = getattr(self, "_console", None)
         live_at = 0.0
         live_lock = asyncio.Lock()
@@ -1181,11 +1198,36 @@ class ChatHandler:
                 stream_broken = True
                 logger.exception("流式分片发送失败：%s", event.user_openid)
 
+        def close_thinking() -> None:
+            """思考结束时补上「已思考(用时 n 秒)」，只追加不改写。"""
+            nonlocal in_thinking
+            if not in_thinking:
+                return
+            in_thinking = False
+            elapsed = max(1, int(round(time.monotonic() - thinking_started_at)))
+            append_body(f"\n[已思考(用时{elapsed}秒)]\n\n")
+
         async def on_reasoning(chunk: str) -> None:
-            nonlocal reasoning_text
+            nonlocal reasoning_text, thinking_chars, thinking_header
+            nonlocal thinking_started_at, in_thinking
             if len(reasoning_text) < 4000:
                 reasoning_text += chunk
             await publish_live("thinking", reasoning_text[-200:])
+            if not thinking_display:
+                return
+            if not thinking_header:
+                thinking_header = True
+                in_thinking = True
+                thinking_started_at = time.monotonic()
+                append_body("[正在深度思考]\n")
+            if thinking_chars < THINKING_STREAM_CHARS:
+                room = THINKING_STREAM_CHARS - thinking_chars
+                text = chunk[:room]
+                thinking_chars += len(text)
+                append_body(text)
+                if thinking_chars >= THINKING_STREAM_CHARS:
+                    append_body("…")
+            await flush()
 
         async def run_tool_with_heartbeat(coro) -> str:
             task = asyncio.create_task(coro)
@@ -1228,14 +1270,20 @@ class ChatHandler:
                 ) as stream:
                     iterator = stream.__aiter__()
                     while True:
-                        try:
-                            delta = await asyncio.wait_for(
-                                anext(iterator), timeout=HEARTBEAT_INTERVAL
+                        # 不能用 wait_for 包 anext：超时会取消底层 async generator，
+                        # 上游只是“暂时没有新 token”，被取消后会直接结束本轮，
+                        # 表现为无正文、无 usage、无 finish_reason，最终走兜底提示。
+                        nxt = asyncio.ensure_future(anext(iterator))
+                        while True:
+                            done, _ = await asyncio.wait(
+                                {nxt}, timeout=HEARTBEAT_INTERVAL
                             )
-                        except asyncio.TimeoutError:
-                            # 模型长时间没有增量时也保持连接并更新“思考中”
+                            if done:
+                                break
+                            # 长时间没有增量时保持 QQ 流式连接，但不打断模型生成
                             await keep_alive()
-                            continue
+                        try:
+                            delta = nxt.result()
                         except StopAsyncIteration:
                             break
                         if len(full_answer) < MAX_FULL_ANSWER_CHARS:
@@ -1244,16 +1292,31 @@ class ChatHandler:
                             round_text += delta
                         chunk = delta[: max(0, body_limit - len(body))]
                         if chunk:
+                            if in_thinking:
+                                close_thinking()
                             answer += chunk
                             append_body(chunk)
                         await flush()
-            except LLMError:
+            except (LLMError, aiohttp.ClientError, asyncio.TimeoutError):
                 llm_failed = True
                 logger.exception("流式生成失败：%s", event.user_openid)
                 break
 
+            if in_thinking:
+                close_thinking()
+                await flush()
+
             await self._charge_usage(
                 event.context_key, state.usage, unlimited=unlimited
+            )
+            logger.debug(
+                "流式第 %d 轮结束：正文 %d 字，思考 %d 字，工具 %d 个，finish=%s，usage=%s",
+                _round + 1,
+                len(round_text),
+                len(state.reasoning_content),
+                len(state.tool_calls),
+                state.finish_reason or "无",
+                bool(state.usage),
             )
             if state.finish_reason == "length" and not state.tool_calls:
                 output_cut = True
@@ -1306,7 +1369,7 @@ class ChatHandler:
                     if label:
                         # 过程信息只能追加在已下发内容之后，不能改写前缀
                         sep = "" if not body or body.endswith("\n") else "\n"
-                        append_body(f"{sep}【{_short(label, 60)}】\n")
+                        append_body(f"{sep}[{_short(label, 60)}]\n")
                     await flush(force=True)
                 result = await run_tool_with_heartbeat(
                     self._run_tool(
@@ -1326,6 +1389,12 @@ class ChatHandler:
             _round += 1
 
         if not full_answer:
+            logger.warning(
+                "模型未产出任何正文，发送兜底提示：%s（已生成 %d 字，正文 %d 字）",
+                event.context_key,
+                len(full_answer),
+                len(body),
+            )
             full_answer = answer or FALLBACK_REPLY
             if not answer:
                 llm_failed = True
