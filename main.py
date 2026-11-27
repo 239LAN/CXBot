@@ -24,6 +24,7 @@ from services.preferences import PreferenceStore
 from services.quota import QuotaManager
 from services.reset_codes import ResetCodeStore
 from services.sandbox import CommandSandbox
+from services.updater import Updater
 from services.web import WebTools
 from services.workspace import WorkspaceTools
 
@@ -89,7 +90,10 @@ async def run(config: Config) -> None:
                 host=config.console_host,
                 port=config.console_port,
                 session_hours=config.console_session_hours,
+                max_upload_mb=config.console_upload_mb,
             )
+
+        updater = Updater(config, session)
 
         handler = ChatHandler(
             config,
@@ -106,10 +110,12 @@ async def run(config: Config) -> None:
             asr,
             blocks,
             console=console,
+            updater=updater,
         )
         gateway = GatewayClient(config, api, tokens, handler.handle)
 
         cleanup_task = asyncio.create_task(_cleanup_loop(workspace, admins))
+        update_task = asyncio.create_task(updater.loop())
 
         if console is not None:
             try:
@@ -122,10 +128,12 @@ async def run(config: Config) -> None:
             await gateway.run()
         finally:
             cleanup_task.cancel()
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass
+            update_task.cancel()
+            for task in (cleanup_task, update_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             if console is not None:
                 await console.stop()
             gateway.stop()

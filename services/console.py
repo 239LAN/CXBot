@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -30,6 +32,8 @@ MAX_GROUP_REPLIES = 5
 PASSIVE_WINDOW = 280.0  # 被动回复有效期约 5 分钟，留一点余量
 CODE_TTL = 30  # 验证码刷新周期（秒）
 COOKIE_NAME = "cxbot_console"
+DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 群聊富媒体与单聊直传上限
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 
 def _attachment_note(event: MessageEvent) -> str:
@@ -54,11 +58,13 @@ class ManualConsole:
         host: str = "127.0.0.1",
         port: int = 8080,
         session_hours: float = 12.0,
+        max_upload_mb: int = 20,
     ) -> None:
         self._api = api
         self._path = Path(path)
         self._history = max(20, history)
         self._max_chars = max(100, max_chars)
+        self._max_upload_bytes = max(1, max_upload_mb) * 1024 * 1024
         self._host = host
         self._port = port
         self._session_ttl = max(60, int(session_hours * 3600))
@@ -334,6 +340,136 @@ class ManualConsole:
         await self._broadcast({"type": "message", "key": key, "held": key in self._held})
         return ""
 
+    async def send_media(
+        self,
+        key: str,
+        file_name: str,
+        data: bytes,
+        *,
+        content_type: str = "",
+        caption: str = "",
+    ) -> str:
+        """人工发送图片或文件，失败时返回错误信息。"""
+        file_name = (file_name or "file").strip() or "file"
+        caption = (caption or "").strip()
+        if not data:
+            return "文件内容为空"
+        if len(data) > self._max_upload_bytes:
+            limit = self._max_upload_bytes // (1024 * 1024)
+            return f"文件过大，控制台上限 {limit}MB"
+
+        async with self._lock:
+            entry = self._sessions.get(key)
+            last = dict(entry.get("last") or {}) if entry else {}
+        if not last.get("msg_id"):
+            return "该会话没有可回复的消息"
+        if time.time() - float(last.get("ts") or 0) > PASSIVE_WINDOW:
+            return "这条消息已超过 5 分钟，无法被动回复，请等用户发新消息"
+
+        kind = last.get("kind") or "c2c"
+        max_replies = MAX_GROUP_REPLIES if kind == "group" else MAX_C2C_REPLIES
+        seq = int(last.get("msg_seq") or 1)
+        available = max_replies - seq + 1
+        need = 2 if caption else 1
+        if available < need:
+            return "这条消息的被动回复次数不足，请等用户发新消息"
+
+        is_image = content_type.lower().startswith("image/") or (
+            Path(file_name).suffix.lower() in IMAGE_SUFFIXES
+        )
+        file_type = 1 if is_image else 4
+
+        try:
+            if caption:
+                if kind == "group":
+                    await self._api.send_group_message(
+                        last.get("group_openid") or "",
+                        caption,
+                        msg_id=last["msg_id"],
+                        msg_seq=seq,
+                        markdown=False,
+                    )
+                else:
+                    await self._api.send_c2c_message(
+                        last.get("user_openid") or "",
+                        caption,
+                        msg_id=last["msg_id"],
+                        msg_seq=seq,
+                        markdown=False,
+                    )
+                seq += 1
+
+            if kind == "group":
+                if len(data) > DIRECT_UPLOAD_MAX_BYTES:
+                    return "群聊暂不支持发送超过 5MB 的文件"
+                file_info = await self._api.upload_group_file(
+                    last.get("group_openid") or "",
+                    file_name=file_name,
+                    file_data=base64.b64encode(data).decode("ascii"),
+                    file_type=file_type,
+                )
+                await self._api.send_group_media(
+                    last.get("group_openid") or "",
+                    file_info,
+                    msg_id=last["msg_id"],
+                    msg_seq=seq,
+                )
+            else:
+                if len(data) <= DIRECT_UPLOAD_MAX_BYTES:
+                    file_info = await self._api.upload_c2c_file(
+                        last.get("user_openid") or "",
+                        file_name=file_name,
+                        file_data=base64.b64encode(data).decode("ascii"),
+                        file_type=file_type,
+                    )
+                else:
+                    file_info = await self._api.upload_c2c_large_file(
+                        last.get("user_openid") or "",
+                        file_name=file_name,
+                        data=data,
+                        file_type=file_type,
+                    )
+                await self._api.send_c2c_media(
+                    last.get("user_openid") or "",
+                    file_info,
+                    msg_id=last["msg_id"],
+                    msg_seq=seq,
+                )
+            seq += 1
+        except QQBotAPIError as exc:
+            logger.warning("人工发送媒体失败：%s", exc.message)
+            return f"发送失败：{exc.message}"
+
+        label = "图片" if is_image else "文件"
+        async with self._lock:
+            entry = self._entry(key)
+            if (entry.get("last") or {}).get("msg_id") == last["msg_id"]:
+                entry["last"]["msg_seq"] = seq
+            if caption:
+                self._append(
+                    key,
+                    {
+                        "dir": "out",
+                        "sender": "operator",
+                        "text": caption,
+                        "ts": time.time(),
+                        "user": "operator",
+                    },
+                )
+            self._append(
+                key,
+                {
+                    "dir": "out",
+                    "sender": "operator",
+                    "text": f"[{label}] {file_name}（{len(data)} 字节）",
+                    "ts": time.time(),
+                    "user": "operator",
+                },
+            )
+            self._save()
+        await self._broadcast({"type": "message", "key": key, "held": key in self._held})
+        return ""
+
     # ---------- 网页接口 ----------
 
     def sessions(self) -> list[dict]:
@@ -451,6 +587,31 @@ class ManualConsole:
             return web.json_response({"ok": False, "error": error}, status=400)
         return web.json_response({"ok": True})
 
+    async def _api_send_media(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response({"ok": False, "error": "未登录"}, status=401)
+        try:
+            payload = await request.json()
+        except ValueError:
+            return web.json_response({"ok": False, "error": "请求格式错误"}, status=400)
+        key = str(payload.get("key") or "")
+        if not key:
+            return web.json_response({"ok": False, "error": "缺少会话标识"}, status=400)
+        try:
+            data = base64.b64decode(str(payload.get("data") or ""), validate=True)
+        except (binascii.Error, ValueError):
+            return web.json_response({"ok": False, "error": "文件内容编码错误"}, status=400)
+        error = await self.send_media(
+            key,
+            str(payload.get("name") or "file"),
+            data,
+            content_type=str(payload.get("type") or ""),
+            caption=str(payload.get("caption") or ""),
+        )
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        return web.json_response({"ok": True})
+
     async def _api_takeover(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
             return web.json_response({"ok": False, "error": "未登录"}, status=401)
@@ -480,7 +641,7 @@ class ManualConsole:
         return ws
 
     def _build_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(client_max_size=self._max_upload_bytes * 2)
         app.router.add_get("/", self._index)
         app.router.add_get("/api/session", self._api_auth)
         app.router.add_post("/api/login", self._api_login)
@@ -488,6 +649,7 @@ class ManualConsole:
         app.router.add_get("/api/sessions", self._api_sessions)
         app.router.add_get("/api/messages", self._api_messages)
         app.router.add_post("/api/send", self._api_send)
+        app.router.add_post("/api/send_media", self._api_send_media)
         app.router.add_post("/api/takeover", self._api_takeover)
         app.router.add_get("/ws", self._ws_handler)
         return app

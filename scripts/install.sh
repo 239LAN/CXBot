@@ -221,6 +221,60 @@ EOF
 
 systemctl daemon-reload
 
+echo "==> 配置自动更新助手"
+UPDATE_HELPER="/usr/local/lib/cxbot-update.sh"
+UPDATE_DIR="$PREFIX/update"
+install -d -m 755 "$UPDATE_DIR"
+chown -R "$RUN_USER":"$RUN_GROUP" "$UPDATE_DIR"
+cat > "$UPDATE_HELPER" <<'HELPER_TEMPLATE'
+#!/bin/bash
+# CXBot 后台更新助手：由 systemd path 单元触发，独立于机器人服务运行。
+set -Eeuo pipefail
+PENDING="__PENDING__"
+LOG="/var/log/cxbot-update.log"
+[ -f "$PENDING" ] || exit 0
+URL="$(head -n 1 "$PENDING" | tr -d '\r')"
+rm -f "$PENDING"
+case "$URL" in
+    https://github.com/*/CXBot/releases/download/*) ;;
+    *) echo "非法更新地址：$URL" >>"$LOG"; exit 1 ;;
+esac
+TMP="$(mktemp /tmp/cxbot-update-XXXXXX.sh)"
+trap 'rm -f "$TMP"' EXIT
+curl -fsSL --retry 3 -o "$TMP" "$URL"
+bash -n "$TMP"
+echo "=== 开始更新 $(date -Is)：$URL" >>"$LOG"
+bash "$TMP" >>"$LOG" 2>&1
+echo "=== 更新结束 $(date -Is)" >>"$LOG"
+HELPER_TEMPLATE
+chmod 755 "$UPDATE_HELPER"
+sed -i "s|__PENDING__|$UPDATE_DIR/pending|" "$UPDATE_HELPER"
+
+cat > /etc/systemd/system/cxbot-update.service <<EOF
+[Unit]
+Description=CXBot auto update
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $UPDATE_HELPER
+EOF
+
+cat > /etc/systemd/system/cxbot-update.path <<EOF
+[Unit]
+Description=Watch CXBot update trigger
+
+[Path]
+PathExists=$UPDATE_DIR/pending
+Unit=cxbot-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cxbot-update.path >/dev/null 2>&1 || true
+
 NEEDS_CONFIG=0
 if [[ "$CREATED_ENV" -eq 1 ]]; then
     NEEDS_CONFIG=1

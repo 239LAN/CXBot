@@ -157,6 +157,12 @@ class Config:
     console_file: Path
     console_history: int
     console_session_hours: float
+    console_upload_mb: int
+
+    auto_update_enabled: bool
+    auto_update_schedule: str
+    update_pending_file: Path
+    update_helper_script: Path
 
     image_gen_enabled: bool
     image_gen_base_url: str
@@ -313,6 +319,15 @@ class Config:
             console_history=max(20, _get_int("CONSOLE_HISTORY", 200)),
             console_session_hours=max(
                 0.1, _get_float("CONSOLE_SESSION_HOURS", 12.0)
+            ),
+            console_upload_mb=max(1, min(50, _get_int("CONSOLE_UPLOAD_MB", 20))),
+            auto_update_enabled=_get_bool("AUTO_UPDATE_ENABLED", False),
+            auto_update_schedule=_get("AUTO_UPDATE_SCHEDULE", "1h"),
+            update_pending_file=Path(
+                _get("UPDATE_PENDING_FILE") or BASE_DIR / "update" / "pending"
+            ),
+            update_helper_script=Path(
+                _get("UPDATE_HELPER_SCRIPT") or "/usr/local/lib/cxbot-update.sh"
             ),
             image_gen_enabled=(
                 _get_bool("IMAGE_GEN_ENABLED", False)

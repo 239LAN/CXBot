@@ -55,7 +55,7 @@ def _parse_tokens(raw: str) -> int | None:
     value = int(text) * multiplier
     return value if value > 0 else None
 
-HELP_TEXT = """可用指令：
+HELP_COMMON = """可用指令：
 /help — 查看帮助
 /about — 查看版本、开源协议与当前设置
 /reset — 清空当前对话上下文
@@ -63,28 +63,41 @@ HELP_TEXT = """可用指令：
 /quota detail — 查看各周期已用/上限
 /workspace — 查看空间占用
 /continue — 继续发送被截断的内容
-/progress — 查看过程显示档位
-/progress off|calls|full|default — 不显示/仅调用/含输出
 /markdown — 查看 Markdown 渲染状态
 /markdown on|off|default — 开/关 Markdown 渲染
-/thinking — 查看思考强度与思考显示
+/thinking — 查看思考强度
 /thinking off|low|medium|high|max|default — 调整思考强度
-/thinking show on|off|default — 开/关思考内容显示（仅私聊流式）
 /length — 查看单次输出上限
 /length <tokens>|default — 设置输出上限（不超过管理员上限）
 /context — 查看上下文预算
 /context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）
-/stream — 查看流式输出状态
-/stream on|off|default — 开/关流式输出（仅私聊）
 /motd <地址> — 探测 Minecraft Java 服务器
 /redeem <重置码> — 恢复自己的额度
-/id — 查看当前会话标识
-管理员：
+/id — 查看当前会话标识"""
+
+HELP_PRIVATE = """
+/progress — 查看过程显示档位
+/progress off|calls|full|default — 不显示/仅调用/含输出
+/thinking show on|off|default — 开/关思考内容显示
+/stream — 查看流式输出状态
+/stream on|off|default — 开/关流式输出"""
+
+HELP_ADMIN = """管理员：
 /gencode [数量] [天数] — 生成重置码
-/resetquota [群标识] — 直接重置群聊额度
+/resetquota [群标识] — 重置额度（群聊默认本群）
 /block <用户标识> — 拉黑用户
 /unblock <用户标识> — 解除拉黑
-/console — 获取网页控制台验证码（30 秒刷新）"""
+/console — 获取网页控制台验证码（30 秒刷新）
+/update — 检查并安装最新版本"""
+
+
+def help_text(*, group: bool, admin: bool) -> str:
+    parts = [HELP_COMMON]
+    if not group:
+        parts.append(HELP_PRIVATE)
+    if admin:
+        parts.append(HELP_ADMIN)
+    return "\n".join(parts)
 
 
 class CommandRouter:
@@ -97,6 +110,7 @@ class CommandRouter:
         admins: AdminStore,
         workspace: WorkspaceTools,
         blocks: BlockStore,
+        updater=None,
     ) -> None:
         self._config = config
         self._quota = quota
@@ -105,6 +119,7 @@ class CommandRouter:
         self._admins = admins
         self._workspace = workspace
         self._blocks = blocks
+        self._updater = updater
 
     async def route(self, event: MessageEvent, text: str) -> str:
         parts = text.split()
@@ -112,7 +127,10 @@ class CommandRouter:
         args = parts[1:]
 
         if command in ("/help", "/帮助"):
-            return HELP_TEXT
+            return help_text(
+                group=event.kind == "group",
+                admin=self._admins.is_admin(event.user_openid),
+            )
         if command in ("/about", "/关于", "/version", "/版本"):
             return await self._about_reply(event)
         if command in ("/quota", "/额度"):
@@ -139,6 +157,8 @@ class CommandRouter:
             return self._block_reply(event, args)
         if command in ("/unblock", "/解除拉黑"):
             return self._unblock_reply(event, args)
+        if command in ("/update", "/更新"):
+            return await self._update_reply(event)
         if command == "/motd":
             return await self._motd_reply(args)
         if command in ("/redeem", "/兑换", "/重置码"):
@@ -498,6 +518,13 @@ class CommandRouter:
         target = normalize_identifier(args[0])
         removed = self._blocks.remove(target)
         return f"已解除拉黑：{target}" if removed else f"不在黑名单：{target}"
+
+    async def _update_reply(self, event: MessageEvent) -> str:
+        if not self._admins.is_admin(event.user_openid):
+            return "仅管理员可以执行更新检查。"
+        if self._updater is None:
+            return "当前环境未启用更新功能。"
+        return await self._updater.check_and_update()
 
     def _can_change_settings(self, event: MessageEvent) -> bool:
         """私聊可改自己的设置；群聊仅群主、群管理员或 Bot 管理员可改。"""

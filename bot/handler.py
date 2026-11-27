@@ -358,6 +358,7 @@ class ChatHandler:
         asr: ASRClient,
         blocks: BlockStore | None = None,
         console: ManualConsole | None = None,
+        updater=None,
     ) -> None:
         self._config = config
         self._api = api
@@ -373,6 +374,7 @@ class ChatHandler:
         self._asr = asr
         self._blocks = blocks or BlockStore(config.block_file)
         self._console = console
+        self._updater = updater
         self._continuations = ContinuationStore()
         self._needs_continue: set[str] = set()
         self._commands = CommandRouter(
@@ -383,6 +385,7 @@ class ChatHandler:
             admins,
             workspace,
             self._blocks,
+            updater=updater,
         )
         self._pending_uploads: dict[str, PendingUploads] = {}
 
@@ -432,13 +435,22 @@ class ChatHandler:
             await self._reply(event, content, markdown=markdown_on)
             return
 
-        if text.lower() in RESET_COMMANDS:
-            self._contexts.reset(key)
-            self._pending_uploads.pop(key, None)
-            self._continuations.clear(key)
-            self._mark_needs_continue(key, False)
-            logger.info("清空上下文：%s", key)
-            await self._reply(event, "上下文已清空，我们重新开始吧。")
+        reset_parts = text.split()
+        if reset_parts and reset_parts[0].lower() in RESET_COMMANDS:
+            target = key
+            if len(reset_parts) > 1 and self._admins.is_admin(event.user_openid):
+                raw = reset_parts[1].strip()
+                if raw:
+                    target = raw if ":" in raw else f"group:{raw}"
+            self._contexts.reset(target)
+            self._pending_uploads.pop(target, None)
+            self._continuations.clear(target)
+            self._mark_needs_continue(target, False)
+            logger.info("清空上下文：%s", target)
+            if target == key:
+                await self._reply(event, "上下文已清空，我们重新开始吧。")
+            else:
+                await self._reply(event, f"已清空会话上下文：{target}")
             return
 
         if text.startswith("/"):

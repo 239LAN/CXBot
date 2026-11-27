@@ -175,6 +175,18 @@
     font-size: 14px;
     font-weight: 600;
   }
+  #mediaBtn {
+    align-self: flex-end;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--text);
+    padding: 10px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  #mediaBtn:disabled { opacity: .5; cursor: not-allowed; }
   #sendBtn:disabled { opacity: .5; cursor: not-allowed; }
   #toast {
     position: fixed;
@@ -308,6 +320,8 @@
   <div id="messages"><div class="empty">暂无消息</div></div>
   <div class="composer">
     <textarea id="input" placeholder="输入要发送的内容，Enter 发送，Shift+Enter 换行" disabled></textarea>
+    <button id="mediaBtn" disabled>图片/文件</button>
+    <input id="fileInput" type="file" hidden>
     <button id="sendBtn" disabled>发送</button>
   </div>
 </main>
@@ -496,6 +510,7 @@ function updateHeader() {
   btn.classList.toggle('on', currentHeld);
   $('input').disabled = !currentKey;
   $('sendBtn').disabled = !currentKey;
+  $('mediaBtn').disabled = !currentKey;
 }
 
 function renderMessages(messages) {
@@ -591,6 +606,51 @@ async function sendMessage() {
   }
 }
 
+function readAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      resolve(text.slice(text.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function sendMedia(file) {
+  if (!currentKey || !file) return;
+  if (file.size > 20 * 1024 * 1024) {
+    toast('文件过大，控制台上限 20MB');
+    return;
+  }
+  $('mediaBtn').disabled = true;
+  try {
+    const data = await readAsBase64(file);
+    const caption = $('input').value.trim();
+    await api('/api/send_media', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: currentKey,
+        name: file.name,
+        type: file.type || '',
+        data,
+        caption,
+      }),
+    });
+    $('input').value = '';
+    toast(`已发送${file.type.startsWith('image/') ? '图片' : '文件'}`);
+    await loadMessages();
+    await loadSessions();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    $('mediaBtn').disabled = !currentKey;
+    $('fileInput').value = '';
+  }
+}
+
 async function toggleHold() {
   if (!currentKey) return;
   try {
@@ -640,6 +700,8 @@ function connectWs() {
 
 $('holdBtn').onclick = toggleHold;
 $('sendBtn').onclick = sendMessage;
+$('mediaBtn').onclick = () => $('fileInput').click();
+$('fileInput').onchange = () => sendMedia($('fileInput').files[0]);
 $('loginBtn').onclick = login;
 $('logoutBtn').onclick = logout;
 $('code').addEventListener('keydown', (e) => {
