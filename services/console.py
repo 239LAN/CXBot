@@ -24,6 +24,7 @@ from aiohttp import web
 
 from bot.api import QQBotAPI, QQBotAPIError
 from bot.events import MessageEvent, split_text
+from services.continuation import ContinuationStore
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ CODE_TTL = 30  # 验证码刷新周期（秒）
 COOKIE_NAME = "cxbot_console"
 DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024  # 群聊富媒体与单聊直传上限
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
 
 
 def _attachment_note(event: MessageEvent) -> str:
@@ -59,12 +61,14 @@ class ManualConsole:
         port: int = 8080,
         session_hours: float = 12.0,
         max_upload_mb: int = 20,
+        continuations: ContinuationStore | None = None,
     ) -> None:
         self._api = api
         self._path = Path(path)
         self._history = max(20, history)
         self._max_chars = max(100, max_chars)
         self._max_upload_bytes = max(1, max_upload_mb) * 1024 * 1024
+        self._continuations = continuations
         self._host = host
         self._port = port
         self._session_ttl = max(60, int(session_hours * 3600))
@@ -292,7 +296,16 @@ class ManualConsole:
         if available <= 0:
             return "这条消息的被动回复次数已用完，请等用户发新消息"
 
-        chunks = split_text(text, self._max_chars, available)
+        capacity = self._max_chars * available
+        head = text
+        rest = ""
+        if len(text) > capacity:
+            cut = max(1, capacity - len(CONTINUE_HINT) - 32)
+            head = text[:cut].rstrip() or text[:cut]
+            rest = text[cut:].lstrip("\n")
+        chunks = split_text(
+            head + (CONTINUE_HINT if rest else ""), self._max_chars, available
+        )
         if not chunks:
             return "内容不能为空"
 
@@ -321,6 +334,9 @@ class ManualConsole:
             if not sent:
                 return f"发送失败：{exc.message}"
             logger.warning("人工回复部分发送失败：%s", exc.message)
+
+        if rest and self._continuations is not None:
+            self._continuations.put(key, rest)
 
         async with self._lock:
             entry = self._entry(key)
@@ -511,6 +527,19 @@ class ManualConsole:
             self._save()
         await self._broadcast({"type": "state", "key": key, "held": held})
 
+    async def release_all(self) -> None:
+        """管理员退出控制台时解除所有会话的人工接管。"""
+        async with self._lock:
+            if not self._held:
+                return
+            held = sorted(self._held)
+            self._held.clear()
+            self._save()
+        logger.info("控制台退出，已解除人工接管：%d 个会话", len(held))
+        await self._broadcast({"type": "state", "held": None})
+        for key in held:
+            await self._broadcast({"type": "state", "key": key, "held": False})
+
     def _index_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / "webapp" / "index.html"
 
@@ -554,6 +583,7 @@ class ManualConsole:
     async def _api_logout(self, request: web.Request) -> web.Response:
         token = request.cookies.get(COOKIE_NAME) or ""
         self._tokens.pop(token, None)
+        await self.release_all()
         response = web.json_response({"ok": True})
         response.del_cookie(COOKIE_NAME, path="/")
         return response
@@ -638,6 +668,9 @@ class ManualConsole:
                 pass
         finally:
             self._ws.discard(ws)
+            if not self._ws:
+                # 关闭网页（无其他在线终端）时停止接管，恢复 AI 自动回复
+                await self.release_all()
         return ws
 
     def _build_app(self) -> web.Application:

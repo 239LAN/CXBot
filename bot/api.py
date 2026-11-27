@@ -14,6 +14,13 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+def _lead_newline(text: str) -> str:
+    """所有发出的文本消息统一以换行开头。"""
+    if not text or text.startswith("\n"):
+        return text
+    return "\n" + text
+
+
 class QQBotAPIError(RuntimeError):
     def __init__(self, status: int, code: object, message: str, path: str) -> None:
         super().__init__(f"QQ OpenAPI 调用失败：{path} HTTP {status} code={code} {message}")
@@ -117,6 +124,7 @@ class QQBotAPI:
         msg_seq: int = 1,
         markdown: bool = False,
     ) -> dict:
+        content = _lead_newline(content)
         if markdown:
             payload: dict = {
                 "msg_type": 2,
@@ -167,6 +175,7 @@ class QQBotAPI:
         markdown: bool = False,
         event_id: str | None = None,
     ) -> dict:
+        content = _lead_newline(content)
         if markdown:
             payload: dict = {
                 "msg_type": 2,

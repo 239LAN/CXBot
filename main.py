@@ -18,6 +18,7 @@ from services.asr import ASRClient
 from services.blocklist import BlockStore
 from services.console import ManualConsole
 from services.context import ContextStore
+from services.continuation import ContinuationStore
 from services.deepseek import DeepSeekClient
 from services.imagegen import ImageClient
 from services.preferences import PreferenceStore
@@ -81,6 +82,7 @@ async def run(config: Config) -> None:
         image = ImageClient(config, session)
 
         console = None
+        continuations = ContinuationStore()
         if config.console_enabled:
             console = ManualConsole(
                 api,
@@ -91,6 +93,7 @@ async def run(config: Config) -> None:
                 port=config.console_port,
                 session_hours=config.console_session_hours,
                 max_upload_mb=config.console_upload_mb,
+                continuations=continuations,
             )
 
         updater = Updater(config, session)
@@ -111,6 +114,7 @@ async def run(config: Config) -> None:
             blocks,
             console=console,
             updater=updater,
+            continuations=continuations,
         )
         gateway = GatewayClient(
             config,

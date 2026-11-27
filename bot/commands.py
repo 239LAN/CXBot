@@ -55,14 +55,20 @@ def _parse_tokens(raw: str) -> int | None:
     value = int(text) * multiplier
     return value if value > 0 else None
 
-HELP_COMMON = """可用指令：
+HELP_COMMON = """基础：
 /help — 查看帮助
 /about — 查看版本、开源协议与当前设置
-/reset — 清空当前对话上下文
+/id — 查看当前会话标识
 /quota — 查看剩余额度
 /quota detail — 查看各周期已用/上限
-/workspace — 查看空间占用
+/workspace — 查看当前会话空间占用
+/reset — 清空当前对话上下文
 /continue — 继续发送被截断的内容
+/cancel — 取消当前会话正在进行的任务
+/redeem <重置码> — 恢复自己的额度
+/motd <地址> — 探测 Minecraft Java 服务器（支持 SRV）
+
+对话设置：
 /markdown — 查看 Markdown 渲染状态
 /markdown on|off|default — 开/关 Markdown 渲染
 /thinking — 查看思考强度
@@ -70,12 +76,9 @@ HELP_COMMON = """可用指令：
 /length — 查看单次输出上限
 /length <tokens>|default — 设置输出上限（不超过管理员上限）
 /context — 查看上下文预算
-/context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）
-/motd <地址> — 探测 Minecraft Java 服务器
-/redeem <重置码> — 恢复自己的额度
-/id — 查看当前会话标识"""
+/context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）"""
 
-HELP_PRIVATE = """
+HELP_PRIVATE = """私聊专属：
 /progress — 查看过程显示档位
 /progress off|calls|full|default — 不显示/仅调用/含输出
 /thinking show on|off|default — 开/关思考内容显示
@@ -84,7 +87,7 @@ HELP_PRIVATE = """
 
 HELP_ADMIN = """管理员：
 /gencode [数量] [天数] — 生成重置码
-/resetquota [群标识] — 重置额度（群聊默认本群）
+/resetquota [群标识] — 重置群额度（群聊默认本群）
 /block <用户标识> — 拉黑用户
 /unblock <用户标识> — 解除拉黑
 /console — 获取网页控制台验证码（30 秒刷新）
@@ -97,7 +100,7 @@ def help_text(*, group: bool, admin: bool) -> str:
         parts.append(HELP_PRIVATE)
     if admin:
         parts.append(HELP_ADMIN)
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 class CommandRouter:
