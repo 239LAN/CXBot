@@ -53,6 +53,26 @@ def _get_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "enabled"}
 
 
+def _get_list(name: str, default: str) -> list[str]:
+    raw = _get(name) or default
+    return [item.strip() for item in raw.replace("\n", ",").split(",") if item.strip()]
+
+
+def _get_model_catalog(name: str, default: str) -> list[tuple[str, str]]:
+    """解析「模型ID|难度说明」列表，用分号分隔，说明里可以带逗号。"""
+    raw = _get(name) or default
+    catalog: list[tuple[str, str]] = []
+    for chunk in raw.replace("\n", ";").split(";"):
+        item = chunk.strip()
+        if not item:
+            continue
+        model, _, desc = item.partition("|")
+        model = model.strip()
+        if model:
+            catalog.append((model, desc.strip()))
+    return catalog
+
+
 @dataclass
 class Config:
     app_id: str
@@ -138,6 +158,15 @@ class Config:
     console_history: int
     console_session_hours: float
 
+    image_gen_enabled: bool
+    image_gen_base_url: str
+    image_gen_api_key: str
+    image_gen_models: list[tuple[str, str]]
+    image_gen_sizes: list[str]
+    image_gen_timeout: float
+    image_gen_credits: int
+    image_gen_max_bytes: int
+
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv(BASE_DIR / ".env")
@@ -163,6 +192,20 @@ class Config:
             max(1024, _get_int("CONTEXT_MAX_TOKENS", 32000)),
         )
 
+        deepseek_base_url = _get(
+            "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
+        ).rstrip("/")
+        image_gen_base_url = (
+            _get("IMAGE_GEN_BASE_URL") or deepseek_base_url
+        ).rstrip("/")
+        image_gen_api_key = _get("IMAGE_GEN_API_KEY") or deepseek_api_key
+        image_gen_models = _get_model_catalog(
+            "IMAGE_GEN_MODELS",
+            "flux.1-schnell|简单快速：草图、简笔画、简单插画"
+            ";flux.1-dev|日常均衡：常见写实与插画"
+            ";gpt-image-1|高质量：复杂构图、精细细节、画面内文字",
+        )
+
         return cls(
             app_id=app_id,
             client_secret=client_secret,
@@ -170,7 +213,7 @@ class Config:
             api_base=_get("QQ_API_BASE", "https://api.sgroup.qq.com").rstrip("/"),
             intents=_get_int("QQ_INTENTS", 1 << 25),
             deepseek_api_key=deepseek_api_key,
-            deepseek_base_url=_get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
+            deepseek_base_url=deepseek_base_url,
             deepseek_model=_get("DEEPSEEK_MODEL", "deepseek-flash"),
             deepseek_temperature=_get_float("DEEPSEEK_TEMPERATURE", 0.8),
             deepseek_max_tokens=_get_int("DEEPSEEK_MAX_TOKENS", 1024),
@@ -270,5 +313,26 @@ class Config:
             console_history=max(20, _get_int("CONSOLE_HISTORY", 200)),
             console_session_hours=max(
                 0.1, _get_float("CONSOLE_SESSION_HOURS", 12.0)
+            ),
+            image_gen_enabled=(
+                _get_bool("IMAGE_GEN_ENABLED", False)
+                and bool(image_gen_api_key)
+                and bool(image_gen_models)
+            ),
+            image_gen_base_url=image_gen_base_url,
+            image_gen_api_key=image_gen_api_key,
+            image_gen_models=image_gen_models,
+            image_gen_sizes=[
+                size
+                for size in _get_list(
+                    "IMAGE_GEN_SIZES", "1024x1024,1024x1792,1792x1024"
+                )
+                if "x" in size.lower()
+            ]
+            or ["1024x1024"],
+            image_gen_timeout=max(10.0, _get_float("IMAGE_GEN_TIMEOUT", 180.0)),
+            image_gen_credits=max(0, _get_int("IMAGE_GEN_CREDITS", 2000)),
+            image_gen_max_bytes=max(
+                1024 * 1024, _get_int("IMAGE_GEN_MAX_MB", 20) * 1024 * 1024
             ),
         )

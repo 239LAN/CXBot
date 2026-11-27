@@ -291,6 +291,49 @@ class QQBotAPI:
             file_type=file_type,
         )
 
+    async def send_group_media(
+        self,
+        group_openid: str,
+        file_info: str,
+        msg_id: str | None = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        """群聊发送富媒体消息（msg_type=7）。"""
+        payload: dict = {"msg_type": 7, "media": {"file_info": file_info}}
+        if msg_id:
+            payload["msg_id"] = msg_id
+            payload["msg_seq"] = msg_seq
+        return await self._request(
+            "POST", f"/v2/groups/{group_openid}/messages", payload
+        )
+
+    async def upload_group_file(
+        self,
+        group_openid: str,
+        *,
+        file_name: str,
+        file_data: str,
+        file_type: int = 4,
+    ) -> str:
+        """上传群聊富媒体文件（base64 直传，≤5MB），返回 file_info。"""
+        path = f"/v2/groups/{group_openid}/files"
+        payload: dict = {
+            "file_type": file_type,
+            "file_name": file_name,
+            "file_data": file_data,
+            "srv_send_msg": False,
+        }
+        data = await self._request(
+            "POST",
+            path,
+            payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        )
+        file_info = data.get("file_info")
+        if not file_info:
+            raise QQBotAPIError(200, None, "上传响应缺少 file_info", path)
+        return str(file_info)
+
     async def send_c2c_media(
         self,
         openid: str,

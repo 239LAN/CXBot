@@ -73,8 +73,9 @@ class QuotaManager:
         file_bytes: int = 0,
         sandbox_seconds: float = 0.0,
         network_bytes: int = 0,
+        credits: int = 0,
     ) -> int:
-        """按各维度向上取整计算积分。"""
+        """按各维度向上取整计算积分；credits 为固定积分（如图片生成）。"""
         input_credits = math.ceil(
             max(0, input_tokens) / self._input_tokens_per_credit
         )
@@ -89,7 +90,8 @@ class QuotaManager:
             max(0, network_bytes) * self._credits_per_mb_network / MB
         )
         return (
-            input_credits
+            max(0, credits)
+            + input_credits
             + output_credits
             + file_credits
             + sandbox_credits
@@ -105,6 +107,7 @@ class QuotaManager:
         file_bytes: int = 0,
         sandbox_seconds: float = 0.0,
         network_bytes: int = 0,
+        credits: int = 0,
     ) -> int:
         """按真实用量扣积分，同时计入用户/群与全站账户。返回本次积分。"""
         credits = self.cost(
@@ -113,6 +116,7 @@ class QuotaManager:
             file_bytes=file_bytes,
             sandbox_seconds=sandbox_seconds,
             network_bytes=network_bytes,
+            credits=credits,
         )
         if credits <= 0:
             return 0

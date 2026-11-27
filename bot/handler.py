@@ -43,6 +43,7 @@ from services.context import ContextStore
 from services.continuation import ContinuationStore
 from services.deepseek import DeepSeekClient, LLMError, StreamState
 from services.documents import DocumentError, extract_text
+from services.imagegen import ImageClient, ImageError, TOOL_NAME as IMAGE_TOOL_NAME
 from services.markdown import close_fences, split_markdown_chunks, tail_after
 from services.preferences import PreferenceStore
 from services.quota import QuotaManager
@@ -352,6 +353,7 @@ class ChatHandler:
         reset_codes: ResetCodeStore,
         admins: AdminStore,
         web: WebTools,
+        image: ImageClient,
         asr: ASRClient,
         blocks: BlockStore | None = None,
         console: ManualConsole | None = None,
@@ -366,6 +368,7 @@ class ChatHandler:
         self._reset_codes = reset_codes
         self._admins = admins
         self._web = web
+        self._image = image
         self._asr = asr
         self._blocks = blocks or BlockStore(config.block_file)
         self._console = console
@@ -549,6 +552,7 @@ class ChatHandler:
                 self._workspace.schemas()
                 + self._web.schemas()
                 + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+                + self._image.schemas()
             )
             if stream_off:
                 # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
@@ -617,7 +621,8 @@ class ChatHandler:
         group_tools = (
             self._workspace.schemas()
             + self._web.schemas()
-            + [SAVE_ATTACHMENT_SCHEMA]
+            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+            + self._image.schemas()
         )
         try:
             await self._text_reply(
@@ -629,6 +634,7 @@ class ChatHandler:
                 reasoning_effort,
                 history_text,
                 tools=group_tools,
+                reply_seq={"next": 1, "reserve": 1},
                 unlimited=unlimited,
                 output_limit=output_limit,
                 context_tokens=context_limit,
@@ -686,6 +692,7 @@ class ChatHandler:
                 self._workspace.schemas()
                 + self._web.schemas()
                 + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+                + self._image.schemas()
             )
             try:
                 answer, ok = await self._stream_reply(
@@ -730,7 +737,8 @@ class ChatHandler:
         group_tools = (
             self._workspace.schemas()
             + self._web.schemas()
-            + [SAVE_ATTACHMENT_SCHEMA]
+            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+            + self._image.schemas()
         )
         try:
             await self._text_reply(
@@ -742,6 +750,7 @@ class ChatHandler:
                 reasoning_effort,
                 "（继续）",
                 tools=group_tools,
+                reply_seq={"next": 1, "reserve": 1},
                 unlimited=unlimited,
                 output_limit=remaining,
                 context_tokens=context_limit,
@@ -1386,11 +1395,13 @@ class ChatHandler:
         if tool_name in WEB_TOOL_NAMES:
             return await self._web.execute(tool_name, arguments)
         if tool_name == "send_file":
-            if event.kind != "c2c":
-                return "发送失败：群聊暂不支持发送空间文件"
             if reply_seq is None:
                 return "发送失败：缺少回复序号"
             return await self._send_file(event, arguments, reply_seq)
+        if tool_name == IMAGE_TOOL_NAME:
+            if reply_seq is None:
+                return "生成失败：缺少回复序号"
+            return await self._generate_image(event, arguments, reply_seq, unlimited)
         if tool_name == "save_attachment":
             return await self._save_attachment(event, arguments)
 
@@ -1474,16 +1485,65 @@ class ChatHandler:
             return f"工具执行失败：{exc}"
         return f"已保存到工作空间：{saved_path}（{size} 字节）"
 
+    async def _upload_media(
+        self, event: MessageEvent, file_name: str, data: bytes, *, file_type: int
+    ) -> str:
+        """按会话类型上传富媒体；群聊只支持 5MB 内直传。"""
+        encoded = base64.b64encode(data).decode("ascii")
+        if event.kind == "group":
+            if len(data) > DIRECT_UPLOAD_MAX_BYTES:
+                raise ToolError("群聊暂不支持发送超过 5MB 的文件")
+            return await self._api.upload_group_file(
+                event.group_openid or "",
+                file_name=file_name,
+                file_data=encoded,
+                file_type=file_type,
+            )
+        if len(data) <= DIRECT_UPLOAD_MAX_BYTES:
+            return await self._api.upload_c2c_file(
+                event.user_openid,
+                file_name=file_name,
+                file_data=encoded,
+                file_type=file_type,
+            )
+        logger.info("文件超过 5MB，走分片上传：%s（%d 字节）", file_name, len(data))
+        return await self._api.upload_c2c_large_file(
+            event.user_openid,
+            file_name=file_name,
+            data=data,
+            file_type=file_type,
+        )
+
+    async def _send_media(
+        self, event: MessageEvent, file_info: str, seq: int
+    ) -> None:
+        if event.kind == "group":
+            await self._api.send_group_media(
+                event.group_openid or "",
+                file_info,
+                msg_id=event.msg_id,
+                msg_seq=seq,
+            )
+        else:
+            await self._api.send_c2c_media(
+                event.user_openid,
+                file_info,
+                msg_id=event.msg_id,
+                msg_seq=seq,
+            )
+
     async def _send_file(
         self, event: MessageEvent, arguments: str, reply_seq: dict
     ) -> str:
-        """把私有空间文件上传并发送给用户（msg_type=7）。"""
+        """把会话空间文件上传并发送给用户（msg_type=7）。"""
         try:
             args = json.loads(arguments or "{}")
             if not isinstance(args, dict):
                 raise ToolError("参数必须是 JSON 对象")
             file_name, data = await asyncio.to_thread(
-                self._workspace.export_file, event.user_openid, args.get("path")
+                self._workspace.export_file,
+                self._workspace_key(event),
+                args.get("path"),
             )
         except ToolError as exc:
             return f"工具执行失败：{exc}"
@@ -1507,26 +1567,12 @@ class ChatHandler:
 
         seq = reply_seq["next"]
         try:
-            if len(data) <= DIRECT_UPLOAD_MAX_BYTES:
-                encoded = base64.b64encode(data).decode("ascii")
-                file_info = await self._api.upload_c2c_file(
-                    event.user_openid,
-                    file_name=file_name,
-                    file_data=encoded,
-                )
-            else:
-                logger.info("文件超过 5MB，走分片上传：%s（%d 字节）", file_name, len(data))
-                file_info = await self._api.upload_c2c_large_file(
-                    event.user_openid,
-                    file_name=file_name,
-                    data=data,
-                )
-            await self._api.send_c2c_media(
-                event.user_openid,
-                file_info,
-                msg_id=event.msg_id,
-                msg_seq=seq,
+            file_info = await self._upload_media(
+                event, file_name, data, file_type=4
             )
+            await self._send_media(event, file_info, seq)
+        except ToolError as exc:
+            return f"发送失败：{exc}"
         except QQBotAPIError as exc:
             logger.exception("发送文件失败：%s", file_name)
             return f"发送文件失败：{exc.message}"
@@ -1536,6 +1582,85 @@ class ChatHandler:
             return f"已发送文件 {file_name}（{len(data)} 字节，管理员不计费）"
         credits = await self._quota.charge(event.context_key, file_bytes=len(data))
         return f"已发送文件 {file_name}（{len(data)} 字节，{credits} 积分）"
+
+    async def _generate_image(
+        self,
+        event: MessageEvent,
+        arguments: str,
+        reply_seq: dict,
+        unlimited: bool = False,
+    ) -> str:
+        """AI 主动调用：生成图片、发送给用户并按固定积分计费。"""
+        if not self._image.enabled:
+            return "生成失败：图片生成未启用"
+        cost = self._image.credits
+        if not unlimited:
+            remaining = await self._quota.remaining(event.context_key)
+            if cost > remaining:
+                return (
+                    f"生成失败：额度不足（本次固定消耗 {cost} 积分，"
+                    f"剩余 {remaining} 积分）。可以先用 /quota 查看用量。"
+                )
+
+        limit = MAX_C2C_PASSIVE_REPLIES - int(reply_seq.get("reserve", 0))
+        if reply_seq["next"] > limit:
+            return "生成失败：本次消息的被动回复次数已用完"
+
+        try:
+            data, ext = await self._image.generate(arguments)
+        except ImageError as exc:
+            return f"生成失败：{exc}"
+        except Exception:
+            logger.exception("图片生成异常")
+            return "生成失败：服务异常，请稍后重试"
+
+        file_name = f"cxbot-image-{int(time.time())}.{ext}"
+        seq = reply_seq["next"]
+        try:
+            file_info = await self._upload_media(
+                event, file_name, data, file_type=1
+            )
+            await self._send_media(event, file_info, seq)
+        except ToolError as exc:
+            saved = await self._save_generated_image(event, file_name, data)
+            if saved:
+                return f"图片已生成，但发送失败（{exc}），已保存到工作空间：{saved}"
+            return f"图片已生成，但发送失败：{exc}"
+        except QQBotAPIError as exc:
+            logger.exception("发送生成图片失败")
+            saved = await self._save_generated_image(event, file_name, data)
+            if saved:
+                return (
+                    f"图片已生成，但发送失败（{exc.message}），"
+                    f"已保存到工作空间：{saved}"
+                )
+            return f"图片已生成，但发送失败：{exc.message}"
+
+        reply_seq["next"] += 1
+        if unlimited:
+            return f"图片已生成并发送（管理员不计费）。回复时不要提及模型名称。"
+        credits = await self._quota.charge(event.context_key, credits=cost)
+        return (
+            f"图片已生成并发送，本次固定消耗 {credits} 积分。"
+            "回复时不要提及模型名称或内部参数。"
+        )
+
+    async def _save_generated_image(
+        self, event: MessageEvent, file_name: str, data: bytes
+    ) -> str:
+        try:
+            saved, _size = await asyncio.to_thread(
+                self._workspace.save_bytes,
+                self._workspace_key(event),
+                f"generated/{file_name}",
+                data,
+                overwrite=True,
+                quota_bytes=self._workspace_quota(event),
+            )
+            return saved
+        except Exception:
+            logger.exception("保存生成图片失败")
+            return ""
 
     async def _charge_usage(
         self, scope: str, usage: dict, *, unlimited: bool = False

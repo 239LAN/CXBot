@@ -19,6 +19,7 @@ from services.blocklist import BlockStore
 from services.console import ManualConsole
 from services.context import ContextStore
 from services.deepseek import DeepSeekClient
+from services.imagegen import ImageClient
 from services.preferences import PreferenceStore
 from services.quota import QuotaManager
 from services.reset_codes import ResetCodeStore
@@ -76,6 +77,7 @@ async def run(config: Config) -> None:
             render_mode=config.web_render_mode,
         )
         asr = ASRClient(config, session)
+        image = ImageClient(config, session)
 
         console = None
         if config.console_enabled:
@@ -100,6 +102,7 @@ async def run(config: Config) -> None:
             reset_codes,
             admins,
             web,
+            image,
             asr,
             blocks,
             console=console,
