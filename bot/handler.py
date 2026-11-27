@@ -1604,6 +1604,9 @@ class ChatHandler:
         token = value.split()[0] if value else ""
         if not token:
             return "设置失败：缺少目标值"
+        if token.startswith(("/", "\\")):
+            # 只允许设置值，禁止借工具调用任意指令（管理员命令一律不可触达）
+            return "设置失败：目标值不合法"
         return await self._commands.route(event, f"{base} {token}")
 
     async def _minecraft_status(self, event: MessageEvent, arguments: str) -> str:

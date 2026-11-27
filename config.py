@@ -365,7 +365,7 @@ class Config:
             ]
             or ["1024x1024"],
             image_gen_timeout=max(10.0, _get_float("IMAGE_GEN_TIMEOUT", 180.0)),
-            image_gen_credits=max(0, _get_int("IMAGE_GEN_CREDITS", 2000)),
+            image_gen_credits=max(0, _get_int("IMAGE_GEN_CREDITS", 10000)),
             image_gen_max_bytes=max(
                 1024 * 1024, _get_int("IMAGE_GEN_MAX_MB", 20) * 1024 * 1024
             ),
