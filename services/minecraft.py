@@ -1,4 +1,4 @@
-"""Minecraft Java 版服务器状态探测（Server List Ping）。"""
+"""Minecraft Java 版服务器状态探测（Server List Ping，支持 SRV 记录）。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,14 @@ import struct
 import time
 from dataclasses import dataclass
 
+try:
+    import dns.asyncresolver
+except ImportError:  # 未安装 dnspython 时跳过 SRV 查询
+    dns = None
+
 DEFAULT_PORT = 25565
+DEFAULT_TIMEOUT = 8.0
+SRV_TIMEOUT = 3.0
 MAX_ADDRESS_LENGTH = 200
 
 # 传统 MOTD 的颜色/格式代码，例如 §a、§l
@@ -27,10 +34,17 @@ class PingResult:
     address: str
     ping_ms: int
     motd: str
+    version: str = ""
+    players_online: int | None = None
+    players_max: int | None = None
+    srv: bool = False
 
 
-def parse_address(raw: str) -> tuple[str, int, str]:
-    """解析 host[:port]，支持 [IPv6]:port。返回 (host, port, 展示地址)。"""
+def parse_address(raw: str) -> tuple[str, int, str, bool]:
+    """解析 host[:port]，支持 [IPv6]:port。
+
+    返回 (host, port, 展示地址, 是否显式指定端口)。
+    """
     display = (raw or "").strip()
     if not display:
         raise MinecraftError("地址为空")
@@ -39,6 +53,7 @@ def parse_address(raw: str) -> tuple[str, int, str]:
 
     host = display
     port = DEFAULT_PORT
+    explicit_port = False
 
     if display.startswith("["):
         end = display.find("]")
@@ -50,13 +65,15 @@ def parse_address(raw: str) -> tuple[str, int, str]:
             if not rest.startswith(":"):
                 raise MinecraftError("端口格式不正确")
             port = _parse_port(rest[1:])
+            explicit_port = True
     elif display.count(":") == 1:
         host, port_text = display.rsplit(":", 1)
         port = _parse_port(port_text)
+        explicit_port = True
 
     if not host or any(ch.isspace() for ch in host):
         raise MinecraftError("地址格式不正确")
-    return host, port, display
+    return host, port, display, explicit_port
 
 
 def _parse_port(text: str) -> int:
@@ -66,6 +83,41 @@ def _parse_port(text: str) -> int:
     if not 1 <= port <= 65535:
         raise MinecraftError("端口超出范围")
     return port
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+async def _lookup_srv(host: str) -> tuple[str, int] | None:
+    """查询 _minecraft._tcp.<host> 的 SRV 记录；没有或失败时返回 None。"""
+    if dns is None:
+        return None
+    try:
+        resolver = dns.asyncresolver.Resolver()
+        resolver.lifetime = SRV_TIMEOUT
+        answers = await resolver.resolve(f"_minecraft._tcp.{host}", "SRV")
+    except Exception:
+        return None
+    records = list(answers)
+    if not records:
+        return None
+    records.sort(key=lambda item: (item.priority, -item.weight))
+    best = records[0]
+    target = str(best.target).rstrip(".")
+    if not target:
+        return None
+    try:
+        port = int(best.port)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return target, port
 
 
 def _pack_varint(value: int) -> bytes:
@@ -200,17 +252,28 @@ async def _ping(
     host: str,
     port: int,
     allow_private: bool,
+    *,
+    explicit_port: bool,
 ) -> PingResult:
     started = time.monotonic()
-    target_ip = await _resolve_public_ip(host, port, allow_private)
+
+    connect_host, connect_port = host, port
+    used_srv = False
+    if not explicit_port and not _is_ip_literal(host):
+        srv = await _lookup_srv(host)
+        if srv is not None:
+            connect_host, connect_port = srv
+            used_srv = True
+
+    target_ip = await _resolve_public_ip(connect_host, connect_port, allow_private)
 
     writer: asyncio.StreamWriter | None = None
     try:
-        reader, writer = await asyncio.open_connection(target_ip, port)
+        reader, writer = await asyncio.open_connection(target_ip, connect_port)
         handshake = (
             _pack_varint(0)
             + _pack_string(host)
-            + struct.pack(">H", port)
+            + struct.pack(">H", connect_port)
             + _pack_varint(1)
         )
         writer.write(_pack_packet(0, handshake))
@@ -229,6 +292,18 @@ async def _ping(
             raise MinecraftError("服务器状态格式不正确")
 
         motd = plain_motd(status.get("description", ""))
+        version = ""
+        version_raw = status.get("version")
+        if isinstance(version_raw, dict):
+            version = str(version_raw.get("name") or "").strip()[:60]
+        players = status.get("players")
+        players_online: int | None = None
+        players_max: int | None = None
+        if isinstance(players, dict):
+            if isinstance(players.get("online"), int):
+                players_online = max(0, players["online"])
+            if isinstance(players.get("max"), int):
+                players_max = max(0, players["max"])
 
         ping_started = time.monotonic()
         try:
@@ -242,7 +317,15 @@ async def _ping(
             # 有些服务器在状态响应后立即断开，退回握手总耗时
             ping_ms = int(round((time.monotonic() - started) * 1000))
 
-        return PingResult(address=display, ping_ms=max(0, ping_ms), motd=motd)
+        return PingResult(
+            address=display,
+            ping_ms=max(0, ping_ms),
+            motd=motd,
+            version=version,
+            players_online=players_online,
+            players_max=players_max,
+            srv=used_srv,
+        )
     except (OSError, asyncio.IncompleteReadError) as exc:
         raise MinecraftError("连接失败") from exc
     finally:
@@ -256,15 +339,22 @@ async def _ping(
 
 async def ping_server(
     address: str,
-    timeout: float = 5.0,
+    timeout: float = DEFAULT_TIMEOUT,
     *,
     allow_private: bool = False,
 ) -> PingResult:
     """探测服务器；超时或失败抛出 MinecraftError。"""
-    host, port, display = parse_address(address)
+    host, port, display, explicit_port = parse_address(address)
     try:
         return await asyncio.wait_for(
-            _ping(display, host, port, allow_private), timeout=timeout
+            _ping(
+                display,
+                host,
+                port,
+                allow_private,
+                explicit_port=explicit_port,
+            ),
+            timeout=timeout,
         )
     except asyncio.TimeoutError as exc:
         raise MinecraftError("连接超时") from exc

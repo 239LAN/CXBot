@@ -432,10 +432,22 @@ class CommandRouter:
             return "用法：/motd <地址>，例如 /motd mc.hypixel.net"
         try:
             result = await ping_server(args[0])
-        except MinecraftError:
-            return "无法连接至服务器"
-        motd = result.motd or "(无 MOTD)"
-        return f"{result.address}  {result.ping_ms}ms\n{motd}"
+        except MinecraftError as exc:
+            return f"查服失败：{exc}"
+
+        lines = [f"{result.address}  {result.ping_ms}ms"]
+        meta: list[str] = []
+        if result.version:
+            meta.append(f"版本 {result.version}")
+        if result.players_max is not None:
+            online = result.players_online or 0
+            meta.append(f"在线 {online}/{result.players_max}")
+        if result.srv:
+            meta.append("SRV")
+        if meta:
+            lines.append("  ".join(meta))
+        lines.append(result.motd or "(无 MOTD)")
+        return "\n".join(lines)
 
     async def _redeem_reply(self, event: MessageEvent, args: list[str]) -> str:
         if not args:

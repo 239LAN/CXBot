@@ -340,6 +340,77 @@ SAVE_ATTACHMENT_SCHEMA = {
     },
 }
 
+SETTINGS_TOOL_NAME = "update_settings"
+SETTINGS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": SETTINGS_TOOL_NAME,
+        "description": (
+            "修改当前会话的对话设置。仅当用户明确要求更改设置时调用，"
+            "不要因为用户描述偏好或假设而主动调整。"
+            "群聊中只有群主、群管理员或 Bot 管理员可以修改本群设置；"
+            "progress、stream、thinking_show 仅私聊有效。"
+            "修改后从下一条消息开始生效，回复时不要提及工具名称。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "setting": {
+                    "type": "string",
+                    "enum": [
+                        "progress",
+                        "markdown",
+                        "thinking",
+                        "thinking_show",
+                        "stream",
+                        "length",
+                        "context",
+                    ],
+                    "description": (
+                        "progress=过程显示，markdown=Markdown 渲染，"
+                        "thinking=思考强度，thinking_show=思考内容显示，"
+                        "stream=流式输出，length=单次输出上限，context=上下文预算"
+                    ),
+                },
+                "value": {
+                    "type": "string",
+                    "description": (
+                        "目标值：progress 用 off/calls/full/default；"
+                        "markdown/stream/thinking_show 用 on/off/default；"
+                        "thinking 用 off/low/medium/high/max/default；"
+                        "length/context 用数字或 32k/default"
+                    ),
+                },
+            },
+            "required": ["setting", "value"],
+        },
+    },
+}
+
+MINECRAFT_TOOL_NAME = "minecraft_status"
+MINECRAFT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": MINECRAFT_TOOL_NAME,
+        "description": (
+            "查询 Minecraft Java 版服务器状态：延迟、版本、在线人数与 MOTD，支持 SRV 记录。"
+            "用户询问某个服务器是否在线、人数、版本或 MOTD 时调用；"
+            "仅支持公网地址，address 可带端口。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "string",
+                    "description": "服务器地址，如 mc.hypixel.net 或 play.example.com:25565",
+                }
+            },
+            "required": ["address"],
+        },
+    },
+}
+
+
 
 class ChatHandler:
     def __init__(
@@ -572,12 +643,7 @@ class ChatHandler:
         markdown_on = await self._preferences.get(key, "markdown") != "off"
 
         if event.kind == "c2c":
-            c2c_tools = (
-                self._workspace.schemas()
-                + self._web.schemas()
-                + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-                + self._image.schemas()
-            )
+            c2c_tools = self._tool_schemas()
             if stream_off:
                 # 关闭流式时仍保留私有空间与发送文件工具，并预留一条文本回复
                 try:
@@ -642,12 +708,7 @@ class ChatHandler:
             return
 
         # 群聊不支持流式，走普通分条回复；工作空间与沙箱按群共享
-        group_tools = (
-            self._workspace.schemas()
-            + self._web.schemas()
-            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-            + self._image.schemas()
-        )
+        group_tools = self._tool_schemas()
         try:
             await self._text_reply(
                 event,
@@ -713,12 +774,7 @@ class ChatHandler:
         console = getattr(self, "_console", None)
 
         if event.kind == "c2c":
-            tools = (
-                self._workspace.schemas()
-                + self._web.schemas()
-                + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-                + self._image.schemas()
-            )
+            tools = self._tool_schemas()
             try:
                 answer, ok = await self._stream_reply(
                     event,
@@ -759,12 +815,7 @@ class ChatHandler:
                 )
             return
 
-        group_tools = (
-            self._workspace.schemas()
-            + self._web.schemas()
-            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-            + self._image.schemas()
-        )
+        group_tools = self._tool_schemas()
         try:
             await self._text_reply(
                 event,
@@ -1107,11 +1158,7 @@ class ChatHandler:
         """单聊流式回复，支持多轮工具调用、过程展示与断点续传。"""
         working = list(messages)
         limit = output_limit or self._admin_output_tokens()
-        tools = (
-            self._workspace.schemas()
-            + self._web.schemas()
-            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
-        )
+        tools = self._tool_schemas()
         reply_seq = {"next": 2}  # 1 留给流式消息
         content_type = "markdown" if markdown_enabled else "text"
         system_suffix = "" if markdown_enabled else PLAIN_TEXT_SUFFIX
@@ -1465,6 +1512,16 @@ class ChatHandler:
         ok = not (llm_failed or rounds_exhausted)
         return full_answer, ok
 
+    def _tool_schemas(self) -> list[dict]:
+        """当前可用的全部工具。"""
+        return (
+            self._workspace.schemas()
+            + self._web.schemas()
+            + [SEND_FILE_SCHEMA, SAVE_ATTACHMENT_SCHEMA]
+            + self._image.schemas()
+            + [SETTINGS_SCHEMA, MINECRAFT_SCHEMA]
+        )
+
     async def _run_tool(
         self,
         event: MessageEvent,
@@ -1485,6 +1542,10 @@ class ChatHandler:
             return await self._generate_image(event, arguments, reply_seq, unlimited)
         if tool_name == "save_attachment":
             return await self._save_attachment(event, arguments)
+        if tool_name == SETTINGS_TOOL_NAME:
+            return await self._update_settings(event, arguments)
+        if tool_name == MINECRAFT_TOOL_NAME:
+            return await self._minecraft_status(event, arguments)
 
         usage: dict = {}
         result = await self._workspace.execute(
@@ -1517,6 +1578,46 @@ class ChatHandler:
         if event.kind == "c2c" and self._admins.is_admin(event.user_openid):
             return self._config.workspace_admin_quota_bytes
         return None
+
+    async def _update_settings(self, event: MessageEvent, arguments: str) -> str:
+        """AI 工具：用户明确要求时修改当前会话设置，复用指令的校验逻辑。"""
+        try:
+            args = json.loads(arguments or "{}")
+        except ValueError:
+            return "设置失败：参数不是合法 JSON"
+        if not isinstance(args, dict):
+            return "设置失败：参数必须是 JSON 对象"
+        setting = str(args.get("setting") or "").strip().lower()
+        value = str(args.get("value") or "").strip()
+        commands = {
+            "progress": "/progress",
+            "markdown": "/markdown",
+            "thinking": "/thinking",
+            "thinking_show": "/thinking show",
+            "stream": "/stream",
+            "length": "/length",
+            "context": "/context",
+        }
+        base = commands.get(setting)
+        if not base:
+            return "设置失败：不支持的设置项"
+        token = value.split()[0] if value else ""
+        if not token:
+            return "设置失败：缺少目标值"
+        return await self._commands.route(event, f"{base} {token}")
+
+    async def _minecraft_status(self, event: MessageEvent, arguments: str) -> str:
+        """AI 工具：查询 Minecraft Java 服务器状态。"""
+        try:
+            args = json.loads(arguments or "{}")
+        except ValueError:
+            return "查服失败：参数不是合法 JSON"
+        if not isinstance(args, dict):
+            return "查服失败：参数必须是 JSON 对象"
+        address = str(args.get("address") or "").strip()
+        if not address:
+            return "查服失败：缺少服务器地址"
+        return await self._commands.route(event, f"/motd {address.split()[0]}")
 
     async def _save_attachment(self, event: MessageEvent, arguments: str) -> str:
         """把当前消息中的附件下载并保存到私有空间。"""

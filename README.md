@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.10-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.11-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -37,7 +37,8 @@
 - 管理员名单：不限额度、不计费、工具轮数不限，输出上限 393216 tokens，上下文预算 1048576 tokens，空间上限 1GB
 - 重置码：一次性恢复自己的额度；管理员可在聊天中生成
 - 黑名单：管理员可拉黑用户，禁止其继续使用
-- Minecraft Java 服务器状态探测
+- Minecraft Java 服务器状态探测：支持 `_minecraft._tcp` SRV 记录，显示延迟、版本、在线人数与 MOTD；AI 也可在用户询问时直接查服
+- AI 代办对话设置：用户明确要求时，AI 可修改过程显示、Markdown、思考强度与显示、流式输出、输出上限与上下文预算（群聊沿用群主/管理员权限）
 
 ## 指令
 
@@ -63,7 +64,7 @@
 | `/thinking show on\|off\|default` | 开 / 关思考内容显示（仅私聊流式） |
 | `/stream` | 查看流式输出状态 |
 | `/stream on\|off\|default` | 开 / 关流式输出（仅私聊） |
-| `/motd <地址>` | 探测 Minecraft Java 服务器 |
+| `/motd <地址>` | 探测 Minecraft Java 服务器（支持 SRV，显示版本与在线人数） |
 | `/redeem <重置码>` | 使用重置码恢复额度 |
 | `/id` | 查看当前会话标识 |
 | `/gencode [数量] [天数]` | 管理员：生成重置码 |
