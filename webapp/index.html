@@ -344,6 +344,7 @@ let currentKey = null;
 let currentHeld = false;
 let currentLive = null;
 let authed = false;
+let uploadMb = 20;
 let ws = null;
 
 const $ = (id) => document.getElementById(id);
@@ -378,6 +379,9 @@ async function checkAuth() {
   try {
     const data = await api('/api/session');
     authed = !!data.authed;
+    if (typeof data.upload_mb === 'number' && data.upload_mb > 0) {
+      uploadMb = data.upload_mb;
+    }
   } catch (e) {
     authed = false;
   }
@@ -620,8 +624,8 @@ function readAsBase64(file) {
 
 async function sendMedia(file) {
   if (!currentKey || !file) return;
-  if (file.size > 20 * 1024 * 1024) {
-    toast('文件过大，控制台上限 20MB');
+  if (file.size > uploadMb * 1024 * 1024) {
+    toast(`文件过大，控制台上限 ${uploadMb}MB`);
     return;
   }
   $('mediaBtn').disabled = true;

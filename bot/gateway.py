@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 EventHandler = Callable[[MessageEvent], Awaitable[None]]
 # 群系统事件回调：(事件名, 事件体, 事件ID)
 RawEventHandler = Callable[[str, dict, str], Awaitable[None]]
-RawEventHandler = Callable[[str, dict], Awaitable[None]]
 
 # Gateway OpCode
 OP_DISPATCH = 0

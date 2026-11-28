@@ -551,7 +551,12 @@ class ManualConsole:
         return web.FileResponse(path)
 
     async def _api_auth(self, request: web.Request) -> web.Response:
-        return web.json_response({"authed": self._authorized(request)})
+        return web.json_response(
+            {
+                "authed": self._authorized(request),
+                "upload_mb": self._max_upload_bytes // (1024 * 1024),
+            }
+        )
 
     async def _api_login(self, request: web.Request) -> web.Response:
         ip = request.remote or "unknown"

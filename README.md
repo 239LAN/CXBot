@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.14-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.15-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
@@ -18,12 +18,12 @@
   - 把空间中的文件发送给用户，超过 5MB 自动分片上传
   - 必应网页搜索、网页抓取（优先 Playwright 等待 JS 加载，回退 curl）
   - 群聊同样开放文件空间与沙箱命令，按群共享
-- 流式过程显示：三档可调（不显示 / 命令与工具调用 / 含输出与结果），默认不显示，`/progress` 切换；开启后工具摘要按发生顺序追加在正文之后
-- 流式正文严格追加：首帧固定零宽空格，之后只追加不替换已下发内容，避免 QQ 40111001
-- 思考内容显示：私聊可开关，开启后以 `[正在深度思考]` 开头、`[已思考(用时 n 秒)]` 结尾，中间最多展示 800 字思考内容，之后接正式回答；同时推送到网页控制台，`/thinking show on|off`
+- 过程显示：`/progress on|off` 开关（默认关闭），开启后按发生顺序显示命令与工具调用摘要，不展示执行结果；流式回复直接追加在正文中，非流式（关闭流式或群聊）先用一条消息发出提示，再发正文
+- 流式正文严格追加：首帧固定零宽空格，之后只追加不替换已下发内容，避免 QQ 40111001；单条流式消息超过 4 分钟会自动换下一条流式消息继续，模型或连接异常最多重试 3 次
+- 思考内容显示：私聊可开关，开启后以 `[正在深度思考]` 开头、`[已思考(用时 n 秒)]` 结尾，中间最多展示 800 字思考内容，之后接正式回答；流式与非流式都支持，同时推送到网页控制台，`/thinking show on|off`
 - 输出长度与上下文预算：`/length`、`/context` 按 token 设置，普通用户上限不超过管理员
 - 群聊设置权限：只有群主、群管理员或 Bot 管理员可以修改本群设置
-- 长回复截断续传：超出单条上限时先发 `……` 与 `发送[/继续]继续`，1 小时内可继续
+- 长回复截断续传：超出单条上限时先发 `……` 与 `发送[/继续]继续`，1 小时内可继续；单聊的续传内容优先用一条流式消息一次发出
 - Markdown 结构感知截断：流式正文只追加不改写，续传按实际已发送长度裁剪并自动重开代码围栏、补表格表头
 - 多模态输入：图片按文件头校正 MIME，大图自动压缩后传给 DeepSeek-Flash 原生视觉理解；文档自动提取文本（txt / md / csv / json / pdf / docx / xlsx / pptx）
 - 只发文件 / 图片时会先提示上传成功，10 分钟内的下一条提示词会合并处理这些附件
@@ -56,8 +56,8 @@
 | `/quota` | 查看剩余额度 |
 | `/quota detail` | 查看各周期已用 / 上限 |
 | `/workspace` | 查看会话空间占用（私聊 / 群聊） |
-| `/progress` | 查看过程显示档位 |
-| `/progress off\|calls\|full\|default` | 不显示 / 命令与工具调用 / 含输出与结果 |
+| `/progress` | 查看过程显示状态 |
+| `/progress off\|on\|default` | 关 / 开过程显示（只显示命令与工具调用） |
 | `/length` | 查看单次输出上限 |
 | `/length <tokens>\|default` | 设置输出上限（不超过管理员上限） |
 | `/context` | 查看上下文预算 |
@@ -66,7 +66,7 @@
 | `/markdown on\|off\|default` | 开 / 关 Markdown 渲染 |
 | `/thinking` | 查看思考强度与思考显示 |
 | `/thinking off\|low\|medium\|high\|max\|default` | 调整思考强度 |
-| `/thinking show on\|off\|default` | 开 / 关思考内容显示（仅私聊流式） |
+| `/thinking show on\|off\|default` | 开 / 关思考内容显示（仅私聊，流式与非流式均生效） |
 | `/stream` | 查看流式输出状态 |
 | `/stream on\|off\|default` | 开 / 关流式输出（仅私聊） |
 | `/motd <地址>` | 探测 Minecraft Java 服务器（支持 SRV，显示版本与在线人数） |

@@ -31,13 +31,11 @@ PROGRESS_VALUES = {
     "关闭": None,
     "不显示": None,
     "default": None,
-    "calls": "calls",
-    "brief": "calls",
-    "仅调用": "calls",
-    "on": "calls",
-    "full": "full",
-    "all": "full",
-    "全部": "full",
+    "on": "on",
+    "calls": "on",
+    "brief": "on",
+    "仅调用": "on",
+    "开启": "on",
 }
 
 GROUP_SETTINGS_DENIED = "只有群主、群管理员或 Bot 管理员可以修改本群设置。"
@@ -79,8 +77,8 @@ HELP_COMMON = """基础：
 /context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）"""
 
 HELP_PRIVATE = """私聊专属：
-/progress — 查看过程显示档位
-/progress off|calls|full|default — 不显示/仅调用/含输出
+/progress — 查看过程显示状态
+/progress off|on|default — 关/开过程显示（只显示调用）
 /thinking show on|off|default — 开/关思考内容显示
 /stream — 查看流式输出状态
 /stream on|off|default — 开/关流式输出"""
@@ -320,18 +318,16 @@ class CommandRouter:
             suffix = "（默认）" if current is None else ""
             return (
                 f"过程显示：{self._progress_label(current)}{suffix}\n"
-                "可设为 off / calls / full"
+                "可设为 off / on"
             )
         value = args[0].lower()
         if value not in PROGRESS_VALUES:
-            return "用法：/progress off|calls|full|default"
+            return "用法：/progress on|off|default"
         stored = PROGRESS_VALUES[value]
         await self._preferences.set(scope, "progress", stored)
         if stored is None:
             return "过程显示已关闭。"
-        if stored == "calls":
-            return "过程显示已开启：只显示命令与工具调用。"
-        return "过程显示已开启：显示命令、输出与工具结果。"
+        return "过程显示已开启：流式回复中显示命令与工具调用。"
 
     async def _length_reply(
         self, event: MessageEvent, args: list[str]
@@ -563,8 +559,6 @@ class CommandRouter:
 
     @staticmethod
     def _progress_label(value: str | None) -> str:
-        if value == "full":
-            return "全部"
-        if value in ("calls", "on"):
-            return "仅调用"
-        return "不显示"
+        if value in (None, "", "off", "none"):
+            return "不显示"
+        return "开启（仅显示调用）"

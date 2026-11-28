@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,7 +50,7 @@ from services.preferences import PreferenceStore
 from services.quota import QuotaManager
 from services.reset_codes import ResetCodeStore
 from services.web import WebTools
-from services.workspace import ToolError, WorkspaceTools
+from services.workspace import MEMORY_FILE, ToolError, WorkspaceTools
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ MAX_CHUNKS = 5  # 群聊/回退消息被动回复同一个 msg_id 最多 5 条
 CHUNK_INTERVAL = 0.25
 
 STREAM_FLUSH_INTERVAL = 0.6  # 秒，避免每来一个 token 都调一次接口
+STREAM_MAX_SECONDS = 240.0  # 单条流式消息的更新时限，超时后改用普通消息续发
 STREAM_MAX_CHARS = 2000
 STREAM_SAFE_CHARS = 1900  # 给 QQ 端与 Markdown 围栏留安全余量
 # 流式消息首帧固定发送零宽空格：QQ 要求已下发内容前缀不可修改（40111001），
@@ -94,6 +96,7 @@ THINKING_STREAM_CHARS = 800  # 私聊开启思考显示时，最多把多少字�
 HEARTBEAT_INTERVAL = 8.0  # 思考或工具执行期间维持流式连接
 MAX_FULL_ANSWER_CHARS = 20000
 CONTINUE_HINT = "\n\n……\n\n发送[/继续]继续"
+CONTINUE_EMPTY = "没有更多需要继续的内容。"
 CONTINUE_CHARS = 1800
 GROUP_EVENT_MAX_TOKENS = 1024  # 入群自我介绍 / 新人欢迎语输出上限
 GROUP_EVENT_MAX_CHARS = 500
@@ -134,6 +137,12 @@ def _short(value: object, limit: int = 80) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _clip_text(value: object, limit: int) -> str:
+    """按字符数截断，保留原有换行（用于思考内容等长文本）。"""
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _tool_arg(arguments: str, key: str) -> str:
     try:
         args = json.loads(arguments or "{}")
@@ -144,108 +153,104 @@ def _tool_arg(arguments: str, key: str) -> str:
     return str(args.get(key) or "").strip()
 
 
+MEMORY_READ_LABEL = "读取了记忆"
+MEMORY_WRITE_LABEL = "修改了记忆"
+MEMORY_WRITE_TOOLS = {
+    "write_file",
+    "append_file",
+    "edit_file",
+    "replace_lines",
+    "delete_file",
+    "delete_dir",
+    "copy_path",
+    "rename_path",
+}
+# 命令里出现这些写法视为“写” MEMORY.md，否则按读取处理
+_COMMAND_WRITE_RE = re.compile(
+    r"(?<![0-9&])>>?|\btee\b|\bsed\s+-i\b|\brm\b|\bmv\b|\bcp\b|\btruncate\b|\bdd\b"
+)
+
+
+def _is_memory_path(path: str) -> bool:
+    return Path(str(path or "").strip()).name.lower() == MEMORY_FILE.lower()
+
+
+def _memory_label(name: str, arguments: str) -> str:
+    """读写默认记忆文件 MEMORY.md 时返回专用提示，其余返回空串。"""
+    if name == "run_command":
+        command = _tool_arg(arguments, "command")
+        if MEMORY_FILE.lower() not in command.lower():
+            return ""
+        if _COMMAND_WRITE_RE.search(command):
+            return MEMORY_WRITE_LABEL
+        return MEMORY_READ_LABEL
+    if name == "read_file":
+        return MEMORY_READ_LABEL if _is_memory_path(_tool_arg(arguments, "path")) else ""
+    if name in MEMORY_WRITE_TOOLS:
+        paths = (_tool_arg(arguments, "path"), _tool_arg(arguments, "new_path"))
+        if any(_is_memory_path(item) for item in paths):
+            return MEMORY_WRITE_LABEL
+    return ""
+
+
 @dataclass
 class ProgressItem:
     label: str
-    result: str = ""
 
 
 @dataclass
 class ProgressTracker:
-    """汇总工具调用，用于流式过程展示。
+    """按发生顺序记录工具调用，用于流式过程展示。"""
 
-    show_result=False 时只显示调用了什么；True 时附带结果摘要。
-    """
-
-    show_result: bool = False
-    reads: list[ProgressItem] = field(default_factory=list)
-    commands: list[ProgressItem] = field(default_factory=list)
-    writes: list[ProgressItem] = field(default_factory=list)
-    others: list[ProgressItem] = field(default_factory=list)
+    items: list[ProgressItem] = field(default_factory=list)
     _last: ProgressItem | None = field(default=None, repr=False)
 
     def record(self, name: str, arguments: str) -> None:
         path = _tool_arg(arguments, "path")
-        if name == "read_file":
-            item = ProgressItem(path or "文件")
-            self.reads.append(item)
+        new_path = _tool_arg(arguments, "new_path")
+        memory = _memory_label(name, arguments)
+        if memory:
+            item = ProgressItem(memory)
+        elif name == "read_file":
+            item = ProgressItem(f"已阅读文档{_short(path or '文件', 60)}")
         elif name == "run_command":
-            item = ProgressItem(_tool_arg(arguments, "command") or "命令")
-            self.commands.append(item)
-        elif name in {
-            "write_file",
-            "append_file",
-            "edit_file",
-            "replace_lines",
-            "copy_file",
-            "move_file",
-            "delete_file",
-            "mkdir",
-        }:
-            item = ProgressItem(path or name)
-            self.writes.append(item)
+            item = ProgressItem(
+                "执行了" + _short(_tool_arg(arguments, "command") or "命令", 80)
+            )
+        elif name == "write_file":
+            item = ProgressItem(f"已创建文档{_short(path or '文件', 60)}")
+        elif name in {"append_file", "edit_file", "replace_lines"}:
+            item = ProgressItem(f"已编辑文档{_short(path or '文件', 60)}")
+        elif name in {"copy_path", "rename_path"}:
+            item = ProgressItem(f"已编辑文档{_short(new_path or path or '文件', 60)}")
+        elif name in {"delete_file", "delete_dir"}:
+            item = ProgressItem(f"已删除{_short(path or '文件', 60)}")
+        elif name == "create_dir":
+            item = ProgressItem(f"已创建目录{_short(path or '目录', 60)}")
         elif name == "list_files":
             item = ProgressItem("查看了文件列表")
-            self.others.append(item)
         elif name == "workspace_usage":
             item = ProgressItem("查看了空间占用")
-            self.others.append(item)
         elif name == "web_search":
-            item = ProgressItem(
-                "搜索了网页：" + _short(_tool_arg(arguments, "query"), 40)
-            )
-            self.others.append(item)
+            item = ProgressItem(f"已搜索“{_short(_tool_arg(arguments, 'query'), 40)}”")
         elif name == "web_fetch":
-            item = ProgressItem(
-                "抓取了网页：" + _short(_tool_arg(arguments, "url"), 60)
-            )
-            self.others.append(item)
+            item = ProgressItem(f"抓取了网页：{_short(_tool_arg(arguments, 'url'), 60)}")
         elif name == "save_attachment":
             item = ProgressItem("保存了附件")
-            self.others.append(item)
         elif name == "send_file":
-            item = ProgressItem("发送了文件：" + _short(path, 40))
-            self.others.append(item)
+            item = ProgressItem(f"发送了文件：{_short(path, 40)}")
         else:
-            item = ProgressItem("调用了 " + name)
-            self.others.append(item)
+            item = ProgressItem(f"调用了 {name}")
+        self.items.append(item)
         self._last = item
-
-    def add_result(self, result: str) -> None:
-        """记录上一次工具调用的结果摘要（仅在完整档位展示）。"""
-        if self._last is not None and result:
-            self._last.result = _short(result, 120)
 
     @property
     def last_label(self) -> str:
         """最近一次工具调用的简短描述。"""
         return self._last.label if self._last is not None else ""
 
-    @staticmethod
-    def _render_items(
-        lines: list[str], items: list[ProgressItem], limit: int, show_result: bool
-    ) -> None:
-        for item in items[-limit:]:
-            lines.append(f"> {_short(item.label, 80)}")
-            if show_result and item.result:
-                lines.append(f"↳ {item.result}")
-
     def render(self) -> str:
-        lines: list[str] = []
-        if self.reads:
-            lines.append(f"[阅读了{len(self.reads)}个文件]")
-            self._render_items(lines, self.reads, 3, self.show_result)
-        if self.commands:
-            lines.append(f"[执行了{len(self.commands)}条命令]")
-            self._render_items(lines, self.commands, 3, self.show_result)
-        if self.writes:
-            lines.append(f"[修改了{len(self.writes)}个文件]")
-            if self.show_result:
-                self._render_items(lines, self.writes, 3, True)
-        for item in self.others[-5:]:
-            lines.append(f"[{item.label}]")
-            if self.show_result and item.result:
-                lines.append(f"↳ {item.result}")
+        lines = [f"[{_short(item.label, 80)}]" for item in self.items[-8:]]
         text = "\n".join(lines)
         if len(text) > MAX_PROGRESS_CHARS:
             text = text[: MAX_PROGRESS_CHARS - 1].rstrip() + "…"
@@ -388,7 +393,7 @@ SETTINGS_SCHEMA = {
                 "value": {
                     "type": "string",
                     "description": (
-                        "目标值：progress 用 off/calls/full/default；"
+                        "目标值：progress 用 off/on/default；"
                         "markdown/stream/thinking_show 用 on/off/default；"
                         "thinking 用 off/low/medium/high/max/default；"
                         "length/context 用数字或 32k/default"
@@ -583,7 +588,7 @@ class ChatHandler:
             await self._reply(event, "你已被限制使用本服务。")
             return
 
-        if text.lower() in ("/continue", "/继续"):
+        if text.strip().lower() in ("/continue", "/继续"):
             # 预留一条消息给“继续”提示，避免分条发送时提示被截断
             chunk_limit = max(
                 200,
@@ -607,6 +612,11 @@ class ChatHandler:
                 return
             chunk, rest = item
             content = chunk + (CONTINUE_HINT if rest else "")
+            # 续传优先用一条流式消息一次性发出已生成部分，避免分条占用被动次数
+            if event.kind == "c2c" and await self._stream_once(
+                event, content, markdown=markdown_on
+            ):
+                return
             await self._reply(event, content, markdown=markdown_on)
             return
 
@@ -765,6 +775,8 @@ class ChatHandler:
                         output_limit=output_limit,
                         context_tokens=context_limit,
                         markdown=markdown_on,
+                        progress_mode=progress_mode,
+                        thinking_display=thinking_display,
                         run_state=state,
                     )
                 finally:
@@ -802,6 +814,8 @@ class ChatHandler:
                     output_limit=output_limit,
                     context_tokens=context_limit,
                     markdown=markdown_on,
+                    progress_mode=progress_mode,
+                    thinking_display=thinking_display,
                     run_state=state,
                 )
                 return
@@ -831,6 +845,8 @@ class ChatHandler:
                 output_limit=output_limit,
                 context_tokens=context_limit,
                 markdown=markdown_on,
+                progress_mode=progress_mode,
+                thinking_display=thinking_display,
                 run_state=state,
             )
         finally:
@@ -985,6 +1001,7 @@ class ChatHandler:
                     thinking_display=thinking_display,
                     markdown_enabled=markdown_on,
                     run_state=state,
+                    fallback=CONTINUE_EMPTY,
                 )
             except QQBotAPIError:
                 await self._text_reply(
@@ -1001,7 +1018,10 @@ class ChatHandler:
                     output_limit=remaining,
                     context_tokens=context_limit,
                     markdown=markdown_on,
+                    progress_mode=progress_mode,
+                    thinking_display=thinking_display,
                     run_state=state,
+                    fallback=CONTINUE_EMPTY,
                 )
                 return
             finally:
@@ -1029,7 +1049,10 @@ class ChatHandler:
                 output_limit=remaining,
                 context_tokens=context_limit,
                 markdown=markdown_on,
+                progress_mode=progress_mode,
+                thinking_display=thinking_display,
                 run_state=state,
+                fallback=CONTINUE_EMPTY,
             )
         finally:
             if console is not None:
@@ -1354,6 +1377,7 @@ class ChatHandler:
         thinking_display: bool = False,
         markdown_enabled: bool = True,
         run_state: RunState | None = None,
+        fallback: str = FALLBACK_REPLY,
     ) -> tuple[str, bool]:
         """单聊流式回复，支持多轮工具调用、过程展示与断点续传。"""
         working = list(messages)
@@ -1366,17 +1390,16 @@ class ChatHandler:
         # 流式正文严格追加：首帧固定 STREAM_PREFIX，之后只增不减。
         # 任何“替换已下发前缀”的写法都会触发 QQ 40111001。
         body_limit = max(300, STREAM_SAFE_CHARS - len(CONTINUE_HINT) - 16)
-        progress = (
-            None
-            if progress_mode == "off"
-            else ProgressTracker(show_result=progress_mode == "full")
-        )
+        progress = None if progress_mode == "off" else ProgressTracker()
         full_answer = ""
         answer = ""
         body = ""
         started = False
         stream_broken = False
         stream_msg_id = ""
+        stream_started_at = 0.0
+        stream_seq = 1  # 当前流式消息占用的被动回复序号
+        stream_prefix_len = 0  # body 中已在之前流式消息里展示过的长度
         index = 0
         last_flush = 0.0
         last_sent_body = ""
@@ -1418,12 +1441,18 @@ class ChatHandler:
                     run_state.partial = body
 
         async def push(content: str) -> None:
-            nonlocal started, stream_msg_id, index, last_flush
+            nonlocal started, stream_msg_id, index, last_flush, stream_started_at
             async with push_lock:
+                first = not started
+                current = 0 if first else index
+                if not first:
+                    # 先分配 index：请求失败也不会复用同一个序号（40111002）
+                    index += 1
                 kwargs = {
                     "input_state": 1,
-                    "index": index,
+                    "index": current,
                     "msg_id": event.msg_id,
+                    "msg_seq": stream_seq,
                     "content_type": content_type,
                 }
                 if stream_msg_id:
@@ -1431,30 +1460,79 @@ class ChatHandler:
                 resp = await self._api.stream_c2c_message(
                     event.user_openid, content, **kwargs
                 )
-                if not started:
+                if first:
                     stream_msg_id = str(resp.get("id") or "")
                     if not stream_msg_id:
                         raise QQBotAPIError(
                             200, None, "流式消息响应缺少 id", "stream_messages"
                         )
                     started = True
+                    stream_started_at = time.monotonic()
+                    index = 1
                     if run_state is not None:
                         run_state.streaming = True
-                index += 1
                 last_flush = time.monotonic()
 
+        async def close_stream(content: str) -> bool:
+            """结束当前流式消息，返回是否成功。"""
+            if not started:
+                return True
+            try:
+                await self._api.stream_c2c_message(
+                    event.user_openid,
+                    STREAM_PREFIX + content,
+                    input_state=10,
+                    index=index,
+                    stream_msg_id=stream_msg_id,
+                    msg_id=event.msg_id,
+                    msg_seq=stream_seq,
+                    content_type=content_type,
+                )
+                return True
+            except QQBotAPIError:
+                logger.warning("结束流式消息失败：%s", event.user_openid)
+                return False
+
         async def flush(force: bool = False) -> None:
-            nonlocal stream_broken, last_sent_body
+            nonlocal stream_broken, last_sent_body, started, stream_msg_id
+            nonlocal stream_started_at, stream_prefix_len, stream_seq, index
             if stream_broken:
                 return
+            if started and time.monotonic() - stream_started_at > STREAM_MAX_SECONDS:
+                # 超过单条流式消息的更新时限（QQ 40034020）后，换一条新流式消息继续
+                current = body[stream_prefix_len:]
+                closed = await close_stream(current)
+                stream_prefix_len += len(current if closed else last_sent_body)
+                started = False
+                stream_msg_id = ""
+                stream_started_at = 0.0
+                index = 0
+                last_sent_body = ""
+                if reply_seq["next"] > MAX_C2C_PASSIVE_REPLIES:
+                    stream_broken = True
+                    logger.warning(
+                        "被动回复次数不足，无法开启新的流式消息：%s",
+                        event.user_openid,
+                    )
+                    return
+                stream_seq = reply_seq["next"]
+                reply_seq["next"] += 1
+                logger.info(
+                    "流式消息超过 %.0f 秒，开启新的流式消息（seq=%d）：%s",
+                    STREAM_MAX_SECONDS,
+                    stream_seq,
+                    event.user_openid,
+                )
             if started and not force:
-                if body == last_sent_body:
+                current = body[stream_prefix_len:]
+                if current == last_sent_body:
                     return
                 if time.monotonic() - last_flush < STREAM_FLUSH_INTERVAL:
                     return
+            content = STREAM_PREFIX + body[stream_prefix_len:]
             try:
-                await push(STREAM_PREFIX + body)
-                last_sent_body = body
+                await push(content)
+                last_sent_body = body[stream_prefix_len:]
                 if answer:
                     await publish_live("answer", answer[-200:])
             except QQBotAPIError:
@@ -1494,14 +1572,21 @@ class ChatHandler:
 
         async def run_tool_with_heartbeat(coro) -> str:
             task = asyncio.create_task(coro)
-            while True:
-                done, _ = await asyncio.wait(
-                    {task}, timeout=HEARTBEAT_INTERVAL
-                )
-                if done:
-                    return task.result()
-                # 工具执行期间重复发送当前内容，避免 QQ 流式连接超时
-                await keep_alive()
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {task}, timeout=HEARTBEAT_INTERVAL
+                    )
+                    if done:
+                        return task.result()
+                    # 工具执行期间重复发送当前内容，避免 QQ 流式连接超时
+                    await keep_alive()
+            except asyncio.CancelledError:
+                # 会话被取消时一并取消工具任务，避免留下后台任务继续跑
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                raise
 
         async def keep_alive() -> None:
             nonlocal stream_broken
@@ -1537,18 +1622,26 @@ class ChatHandler:
                         # 上游只是“暂时没有新 token”，被取消后会直接结束本轮，
                         # 表现为无正文、无 usage、无 finish_reason，最终走兜底提示。
                         nxt = asyncio.ensure_future(anext(iterator))
-                        while True:
-                            done, _ = await asyncio.wait(
-                                {nxt}, timeout=HEARTBEAT_INTERVAL
-                            )
-                            if done:
-                                break
-                            # 长时间没有增量时保持 QQ 流式连接，但不打断模型生成
-                            await keep_alive()
                         try:
-                            delta = nxt.result()
-                        except StopAsyncIteration:
-                            break
+                            while True:
+                                done, _ = await asyncio.wait(
+                                    {nxt}, timeout=HEARTBEAT_INTERVAL
+                                )
+                                if done:
+                                    break
+                                # 长时间没有增量时保持 QQ 流式连接，但不打断模型生成
+                                await keep_alive()
+                            try:
+                                delta = nxt.result()
+                            except StopAsyncIteration:
+                                break
+                        finally:
+                            # 外层被取消时先结束读取任务，否则 aclosing 关闭仍在运行的
+                            # 异步生成器会报 “asynchronous generator is already running”
+                            if not nxt.done():
+                                nxt.cancel()
+                                with contextlib.suppress(BaseException):
+                                    await nxt
                         if len(full_answer) < MAX_FULL_ANSWER_CHARS:
                             full_answer += delta
                         if len(round_text) < MAX_FULL_ANSWER_CHARS:
@@ -1639,9 +1732,6 @@ class ChatHandler:
                         event, tool_name, arguments, reply_seq, unlimited=unlimited
                     )
                 )
-                if progress is not None and progress.show_result:
-                    progress.add_result(result)
-                    await publish_live("tool", progress.render(), True)
                 working.append(
                     {
                         "role": "tool",
@@ -1658,13 +1748,18 @@ class ChatHandler:
                 len(full_answer),
                 len(body),
             )
-            full_answer = answer or FALLBACK_REPLY
-            if not answer:
-                llm_failed = True
+            full_answer = fallback
+            llm_failed = True
+            append_body(fallback, STREAM_SAFE_CHARS)
 
         # 已下发内容不可修改：剩余内容按实际已发送长度（len(answer)）裁剪，
         # 并自动重开代码围栏、补表格表头，保证 /继续 单独发出时结构完整。
-        rest_text = full_answer[len(answer):] if full_answer.startswith(answer) else ""
+        # answer 为空表示没有任何正文被下发（如兜底提示），此时不生成续传。
+        rest_text = (
+            full_answer[len(answer):]
+            if answer and full_answer.startswith(answer)
+            else ""
+        )
         if rest_text:
             if markdown_enabled:
                 rest_text = tail_after(answer, rest_text)
@@ -1680,28 +1775,28 @@ class ChatHandler:
             closing = close_fences(body)[len(body):]
             append_body(closing, STREAM_SAFE_CHARS)
 
-        if not body:
-            append_body(FALLBACK_REPLY, STREAM_SAFE_CHARS)
-            llm_failed = True
         final_display = STREAM_PREFIX + body
 
-        if started:
-            try:
-                await self._api.stream_c2c_message(
-                    event.user_openid,
-                    STREAM_PREFIX + body,
-                    input_state=10,
-                    index=index,
-                    stream_msg_id=stream_msg_id,
-                    msg_id=event.msg_id,
-                    content_type=content_type,
+        if started and stream_broken:
+            # 流式消息已不可更新（被拒绝），把还没下发的内容用普通消息补发
+            tail = body[stream_prefix_len + len(last_sent_body):]
+            if tail:
+                await self._reply(
+                    event,
+                    tail,
+                    start_seq=reply_seq["next"],
+                    markdown=markdown_enabled,
                 )
+            console = getattr(self, "_console", None)
+            if console is not None:
+                await console.record_outbound(event, full_answer, replies=1)
+        elif started:
+            if await close_stream(body[stream_prefix_len:]):
                 console = getattr(self, "_console", None)
                 if console is not None:
                     await console.record_outbound(event, full_answer, replies=1)
-            except QQBotAPIError:
-                logger.exception("结束流式消息失败，回退普通消息：%s", event.user_openid)
-                tail = body[len(last_sent_body):] if len(last_sent_body) < len(body) else ""
+            else:
+                tail = body[stream_prefix_len + len(last_sent_body):]
                 if tail:
                     await self._reply(
                         event,
@@ -1709,6 +1804,16 @@ class ChatHandler:
                         start_seq=reply_seq["next"],
                         markdown=markdown_enabled,
                     )
+        elif stream_prefix_len:
+            # 之前的流式消息都已正常结束，只补发最后一段
+            remaining = body[stream_prefix_len:]
+            if remaining:
+                await self._reply(
+                    event,
+                    remaining,
+                    start_seq=reply_seq["next"],
+                    markdown=markdown_enabled,
+                )
         else:
             # 没有成功创建过流式消息，用普通消息兜底
             await self._reply(event, final_display, markdown=markdown_enabled)
@@ -2185,12 +2290,11 @@ class ChatHandler:
 
     @staticmethod
     def _progress_mode(value: str | None) -> str:
-        """过程显示档位：off / calls / full（兼容旧值 on）。"""
-        if value == "full":
-            return "full"
-        if value in ("calls", "on"):
-            return "calls"
-        return "off"
+        """过程显示开关：只有 on / off（兼容旧值 calls / full）。"""
+        text = (value or "").strip().lower()
+        if text in ("", "off", "none", "0", "false", "no", "关闭", "不显示"):
+            return "off"
+        return "on"
 
     def _thinking_params(self, value: str | None) -> tuple[bool, str]:
         if not value:
@@ -2220,6 +2324,9 @@ class ChatHandler:
         context_tokens: int | None = None,
         markdown: bool = True,
         run_state: RunState | None = None,
+        progress_mode: str = "off",
+        thinking_display: bool = False,
+        fallback: str = FALLBACK_REPLY,
     ) -> None:
         """群聊与流式兜底：非流式回复，支持网页搜索/抓取工具。"""
         working = list(messages)
@@ -2230,6 +2337,9 @@ class ChatHandler:
         tool_schemas = self._web.schemas() if tools is None else tools
         system_suffix = "" if markdown else PLAIN_TEXT_SUFFIX
         answer = ""
+        started_at = time.monotonic()
+        progress = None if progress_mode == "off" else ProgressTracker()
+        reasoning_text = ""
 
         round_limit = self._round_limit(unlimited)
         _round = 0
@@ -2247,9 +2357,11 @@ class ChatHandler:
                 )
             except LLMError:
                 logger.exception("生成回复失败：%s", key)
-                await self._reply(event, FALLBACK_REPLY, markdown=markdown)
+                await self._reply(event, fallback, markdown=markdown)
                 return
 
+            if thinking_display and state.reasoning_content:
+                reasoning_text += state.reasoning_content
             if run_state is not None and answer:
                 run_state.partial = answer
             await self._charge_usage(key, usage, unlimited=unlimited)
@@ -2296,6 +2408,10 @@ class ChatHandler:
                 tool_name = call["function"]["name"]
                 arguments = call["function"]["arguments"]
                 logger.info("调用工具 %s：%s", tool_name, arguments[:200])
+                if progress is not None:
+                    progress.record(tool_name, arguments)
+                    if console is not None:
+                        await console.publish(key, "tool", progress.render())
                 result = await self._run_tool(
                     event, tool_name, arguments, reply_seq, unlimited=unlimited
                 )
@@ -2309,7 +2425,22 @@ class ChatHandler:
             _round += 1
 
         if not answer:
-            answer = FALLBACK_REPLY
+            answer = fallback
+        notice_parts: list[str] = []
+        if thinking_display and reasoning_text:
+            elapsed = max(1, int(round(time.monotonic() - started_at)))
+            notice_parts.append(
+                "[正在深度思考]\n"
+                + _clip_text(reasoning_text, THINKING_STREAM_CHARS)
+                + f"\n[已思考(用时{elapsed}秒)]"
+            )
+        if progress is not None:
+            rendered = progress.render()
+            if rendered:
+                notice_parts.append(rendered)
+        notice = _clip_text(
+            "\n\n".join(notice_parts), self._config.max_reply_chars - 1
+        )
         self._contexts.append_turn(
             key,
             user_text,
@@ -2319,12 +2450,64 @@ class ChatHandler:
         if run_state is not None:
             # 正在发送最终回复，避免取消时重复补发同一段内容
             run_state.partial = ""
+        seq = reply_seq["next"] if reply_seq else 1
+        if notice:
+            # 非流式：用一条消息先发思考与工具调用，再发正文
+            await self._reply(event, notice, start_seq=seq)
+            seq += 1
+            if reply_seq is not None:
+                reply_seq["next"] = seq
         await self._reply(
             event,
             answer,
-            start_seq=reply_seq["next"] if reply_seq else 1,
+            start_seq=seq,
             markdown=markdown,
         )
+
+    async def _stream_once(
+        self, event: MessageEvent, text: str, *, markdown: bool = True
+    ) -> bool:
+        """用一条流式消息一次性发送文本（/继续 用）；首帧失败返回 False。"""
+        if event.kind != "c2c" or not text:
+            return False
+        body = _clip_text(text, STREAM_SAFE_CHARS)
+        content_type = "markdown" if markdown else "text"
+        try:
+            data = await self._api.stream_c2c_message(
+                event.user_openid,
+                STREAM_PREFIX + body,
+                input_state=1,
+                index=0,
+                msg_id=event.msg_id,
+                msg_seq=1,
+                content_type=content_type,
+            )
+        except QQBotAPIError:
+            logger.exception("续传流式首帧发送失败，回退普通消息：%s", event.msg_id)
+            return False
+        stream_msg_id = str((data or {}).get("id") or "")
+        if not stream_msg_id:
+            logger.warning("续传流式消息缺少 id，回退普通消息：%s", event.msg_id)
+            return False
+        try:
+            await self._api.stream_c2c_message(
+                event.user_openid,
+                STREAM_PREFIX + body,
+                input_state=10,
+                index=1,
+                stream_msg_id=stream_msg_id,
+                msg_id=event.msg_id,
+                msg_seq=1,
+                content_type=content_type,
+            )
+        except QQBotAPIError:
+            # 内容已经下发，结束帧失败只记录，不再重复发送
+            logger.exception("续传流式结束帧发送失败：%s", event.msg_id)
+
+        console = getattr(self, "_console", None)
+        if console is not None:
+            await console.record_outbound(event, body, replies=1)
+        return True
 
     async def _reply(
         self,
@@ -2333,13 +2516,13 @@ class ChatHandler:
         start_seq: int = 1,
         markdown: bool = False,
     ) -> None:
-        if event.kind == "c2c":
-            max_chunks = min(MAX_CHUNKS, MAX_C2C_PASSIVE_REPLIES - start_seq + 1)
-            if max_chunks <= 0:
-                logger.warning("被动回复次数已用完，跳过文本回复：%s", event.msg_id)
-                return
-        else:
-            max_chunks = MAX_CHUNKS
+        max_replies = (
+            MAX_C2C_PASSIVE_REPLIES if event.kind == "c2c" else MAX_CHUNKS
+        )
+        max_chunks = min(MAX_CHUNKS, max_replies - start_seq + 1)
+        if max_chunks <= 0:
+            logger.warning("被动回复次数已用完，跳过文本回复：%s", event.msg_id)
+            return
 
         if markdown:
             chunks = split_markdown_chunks(
@@ -2351,7 +2534,7 @@ class ChatHandler:
             return
 
         for offset, chunk in enumerate(chunks):
-            seq = start_seq + offset if event.kind == "c2c" else offset + 1
+            seq = start_seq + offset
 
             async def send_chunk(use_markdown: bool) -> None:
                 if event.kind == "group":

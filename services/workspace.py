@@ -21,6 +21,7 @@ MAX_READ_BYTES = 64 * 1024
 MAX_LIST_ENTRIES = 200
 MAX_TOOL_RESULT_CHARS = 8000
 MAX_SEND_FILE_BYTES = 200 * MB  # QQ 富媒体文件硬上限
+MEMORY_FILE = "MEMORY.md"  # 默认记忆文件（会话空间根目录）
 
 TOOL_SCHEMAS: list[dict] = [
     {
@@ -54,7 +55,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "读取私有空间中的文本文件。单次最多读取 64KB，超出部分会被截断。"
                 "可通过 start_line / end_line 按行读取（行号从 1 开始，包含结束行），"
-                "按行读取时结果会带行号。"
+                "按行读取时结果会带行号。默认记忆文件是 MEMORY.md，读取它可以恢复长期记忆。"
             ),
             "parameters": {
                 "type": "object",
@@ -77,7 +78,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "创建或整体覆盖私有空间中的文本文件，目录不存在会自动创建。内容超过约 2000 字时，先写入开头，再用 append_file 分段追加，避免单次参数过长被截断。",
+            "description": "创建或整体覆盖私有空间中的文本文件，目录不存在会自动创建。需要长期记住的信息写入默认记忆文件 MEMORY.md。内容超过约 2000 字时，先写入开头，再用 append_file 分段追加，避免单次参数过长被截断。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -232,6 +233,7 @@ TOOL_SCHEMAS: list[dict] = [
                 "默认超时 10 秒，输出最多 8000 字符。运行环境为受限沙箱（Linux 优先使用 "
                 "bubblewrap，隔离进程；仅私有空间可写），网络是否可用由部署配置决定，"
                 "通常可以访问外网。适合运行脚本、处理文本、查看文件等；"
+                "可用 cat 等命令读取默认记忆文件 MEMORY.md，或重定向写入其中。"
                 "不要用于安装系统软件或修改系统文件。"
             ),
             "parameters": {
