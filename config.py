@@ -261,7 +261,7 @@ class Config:
             * 1024
             * 1024,
             workspace_cleanup_days=max(1, _get_int("WORKSPACE_CLEANUP_DAYS", 30)),
-            sandbox_mode=_get("SANDBOX_MODE", "auto").lower(),
+            sandbox_mode=_get("SANDBOX_MODE", "bwrap").lower(),
             sandbox_network=_get_bool("SANDBOX_NETWORK", True),
             sandbox_cpu_percent=max(
                 1, min(100, _get_int("SANDBOX_CPU_PERCENT", 10))

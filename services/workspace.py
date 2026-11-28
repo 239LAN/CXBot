@@ -316,6 +316,10 @@ class WorkspaceTools:
                     root, args.get("command"), args.get("timeout"), usage
                 )
                 text = result.output
+                limit = self._quota_override.get() or self._quota
+                warning = await asyncio.to_thread(self._enforce_quota, root, limit)
+                if warning:
+                    text += "\n" + warning
             else:
                 tool = getattr(self, f"_tool_{name}", None)
                 if tool is None:
@@ -502,6 +506,45 @@ class WorkspaceTools:
                 f"空间不足：已用 {self._fmt_size(used)}，本次需要 {self._fmt_size(delta)}，"
                 f"上限 {self._fmt_size(limit)}"
             )
+
+    def _enforce_quota(self, root: Path, limit: int) -> str:
+        """命令执行后兜底：超出配额时删除最近写入的文件，避免写满宿主磁盘。
+
+        文件工具本身已做配额校验，但 shell 命令可以直接写文件，这里补充检查。
+        MEMORY.md 不参与清理。
+        """
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for path in root.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, stat.st_size, path))
+            total += stat.st_size
+        if total <= limit:
+            return ""
+        entries.sort(key=lambda item: item[0], reverse=True)
+        removed = 0
+        for _mtime, size, path in entries:
+            if total <= limit:
+                break
+            if path.name == MEMORY_FILE:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+        if not removed:
+            return f"（工作空间已超出 {self._fmt_size(limit)} 配额，且无法自动清理，请手动删除文件）"
+        return (
+            f"（工作空间超出 {self._fmt_size(limit)} 配额，"
+            f"已清理最近写入的 {removed} 个文件）"
+        )
 
     @staticmethod
     def _fmt_size(size: int) -> str:

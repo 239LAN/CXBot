@@ -241,6 +241,7 @@ class CommandSandbox:
     def _probe_bwrap(self) -> bool:
         try:
             args = [self._bwrap or "bwrap", "--die-with-parent"]
+            args += self._namespace_flags()
             if not self._allow_network:
                 args.append("--unshare-net")
             args += ["--ro-bind", "/", "/", "--", "true"]
@@ -248,6 +249,11 @@ class CommandSandbox:
             return result.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
+
+    @staticmethod
+    def _namespace_flags() -> list[str]:
+        """额外隔离主机名、IPC 与 cgroup 视图。"""
+        return ["--unshare-uts", "--unshare-ipc", "--unshare-cgroup"]
 
     def _probe_systemd_run(self) -> str | None:
         """检测能否用 systemd-run 的 cgroup 做 CPU/内存/流量限制。"""
@@ -341,6 +347,7 @@ class CommandSandbox:
             self._bwrap or "bwrap",
             "--die-with-parent",
             "--new-session",
+            *self._namespace_flags(),
         ]
         if not self._allow_network:
             args.append("--unshare-net")
@@ -458,6 +465,9 @@ class CommandSandbox:
                     resource.RLIMIT_FSIZE, (FILE_SIZE_LIMIT, FILE_SIZE_LIMIT)
                 )
                 resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+                # 防止 fork 炸弹耗尽宿主机进程/内存（systemd-run 不可用时没有 TasksMax）
+                resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             except (ValueError, OSError):
                 pass
 

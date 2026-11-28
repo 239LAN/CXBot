@@ -642,7 +642,9 @@ class ChatHandler:
             command = text.split()[0].lower()
             console = getattr(self, "_console", None)
             if command in ("/console", "/控制台", "/验证码"):
-                if console is None:
+                if event.kind != "c2c":
+                    reply = "网页控制台验证码仅能在私聊中获取。"
+                elif console is None:
                     reply = "网页控制台未启用（CONSOLE_ENABLED=off）。"
                 elif not self._admins.is_admin(event.user_openid):
                     reply = "仅 Bot 管理员可以获取网页控制台验证码。"

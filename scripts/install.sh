@@ -275,6 +275,89 @@ EOF
 systemctl daemon-reload
 systemctl enable --now cxbot-update.path >/dev/null 2>&1 || true
 
+echo "==> 配置沙箱出网过滤"
+SANDBOX_NET_HELPER="/usr/local/lib/cxbot-sandbox-net.sh"
+RUN_UID="$(id -u "$RUN_USER" 2>/dev/null || echo 0)"
+cat > "$SANDBOX_NET_HELPER" <<'SBX_TEMPLATE'
+#!/bin/bash
+# CXBot 沙箱出网过滤：只放行公网，拦截回环、内网、链路本地与 CGNAT。
+# 仅作用于运行用户（机器人 + 沙箱），默认网关与本机 DNS 例外。
+set -Eeuo pipefail
+RUN_UID="__RUN_UID__"
+TAG="CXBOT_SBX"
+V6TAG="CXBOT_SBX6"
+
+apply_v4() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -N "$TAG" 2>/dev/null || true
+    iptables -F "$TAG"
+    iptables -C OUTPUT -j "$TAG" 2>/dev/null || iptables -A OUTPUT -j "$TAG"
+    GW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+    if [ -n "$GW" ]; then
+        iptables -A "$TAG" -m owner --uid-owner "$RUN_UID" -d "$GW" -j ACCEPT
+    fi
+    for dns in 127.0.0.53 127.0.0.54; do
+        iptables -A "$TAG" -m owner --uid-owner "$RUN_UID" -d "$dns" -p udp --dport 53 -j ACCEPT
+        iptables -A "$TAG" -m owner --uid-owner "$RUN_UID" -d "$dns" -p tcp --dport 53 -j ACCEPT
+    done
+    for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8; do
+        iptables -A "$TAG" -m owner --uid-owner "$RUN_UID" -d "$net" -j REJECT
+    done
+}
+
+apply_v6() {
+    command -v ip6tables >/dev/null 2>&1 || return 0
+    ip6tables -N "$V6TAG" 2>/dev/null || true
+    ip6tables -F "$V6TAG"
+    ip6tables -C OUTPUT -j "$V6TAG" 2>/dev/null || ip6tables -A OUTPUT -j "$V6TAG"
+    ip6tables -A "$V6TAG" -m owner --uid-owner "$RUN_UID" -d ::1/128 -p udp --dport 53 -j ACCEPT
+    ip6tables -A "$V6TAG" -m owner --uid-owner "$RUN_UID" -d ::1/128 -p tcp --dport 53 -j ACCEPT
+    for net in ::1/128 fc00::/7 fe80::/10; do
+        ip6tables -A "$V6TAG" -m owner --uid-owner "$RUN_UID" -d "$net" -j REJECT
+    done
+}
+
+clear_rules() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -D OUTPUT -j "$TAG" 2>/dev/null || true
+    iptables -F "$TAG" 2>/dev/null || true
+    iptables -X "$TAG" 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D OUTPUT -j "$V6TAG" 2>/dev/null || true
+        ip6tables -F "$V6TAG" 2>/dev/null || true
+        ip6tables -X "$V6TAG" 2>/dev/null || true
+    fi
+}
+
+case "${1:-apply}" in
+    apply) apply_v4; apply_v6 ;;
+    clear) clear_rules ;;
+esac
+SBX_TEMPLATE
+chmod 755 "$SANDBOX_NET_HELPER"
+sed -i "s|__RUN_UID__|$RUN_UID|" "$SANDBOX_NET_HELPER"
+
+cat > /etc/systemd/system/cxbot-sandbox-net.service <<EOF
+[Unit]
+Description=CXBot sandbox network filter
+After=network-online.target
+Wants=network-online.target
+Before=$SERVICE_NAME
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $SANDBOX_NET_HELPER apply
+ExecStop=/bin/bash $SANDBOX_NET_HELPER clear
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cxbot-sandbox-net.service >/dev/null 2>&1 || \
+    echo "警告：沙箱出网过滤未启用（可手动执行 $SANDBOX_NET_HELPER apply）"
+
 NEEDS_CONFIG=0
 if [[ "$CREATED_ENV" -eq 1 ]]; then
     NEEDS_CONFIG=1

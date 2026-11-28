@@ -78,7 +78,11 @@ HELP_COMMON = """基础：
 /length <tokens>|default — 设置输出上限（不超过管理员上限）
 /context — 查看上下文预算
 /context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）
-群聊中只有群主、群管理员或 Bot 管理员可以修改这些设置"""
+群聊中只有群主、群管理员或 Bot 管理员可以修改这些设置
+
+提示：
+· 群聊请先 @机器人 再发送指令
+· 也可以直接让 AI 修改设置，例如「把过程显示打开」"""
 
 HELP_PRIVATE = """私聊专属：
 /stream — 查看流式输出状态
@@ -89,7 +93,7 @@ HELP_ADMIN = """管理员：
 /resetquota [群标识] — 重置群额度（群聊默认本群）
 /block <用户标识> — 拉黑用户
 /unblock <用户标识> — 解除拉黑
-/console — 获取网页控制台验证码（30 秒刷新）
+/console — 获取网页控制台验证码（仅私聊，30 秒刷新；别名 /控制台、/验证码）
 /update — 检查并安装最新版本"""
 
 
@@ -185,12 +189,10 @@ class CommandRouter:
         if event.kind == "c2c":
             stream = await self._preferences.get(scope, "stream")
             stream_label = "关闭" if stream == "off" else "开启"
-            progress_label = self._progress_label(progress)
-            reasoning_label = "开启" if reasoning == "on" else "关闭"
         else:
             stream_label = "不支持"
-            progress_label = "不支持"
-            reasoning_label = "不支持"
+        progress_label = self._progress_label(progress)
+        reasoning_label = "开启" if reasoning == "on" else "关闭"
 
         lines = [
             f"CXBot v{__version__}",
@@ -207,10 +209,11 @@ class CommandRouter:
             "",
             "主要功能",
             "· 流式对话与长文续传",
-            "· 文件读写与工作空间",
-            "· 在线命令执行",
+            "· 文件读写与会话空间",
+            "· 在线命令执行（沙箱）",
             "· 网页搜索与抓取",
             "· 文档解析、图片识别、语音转写",
+            "· AI 画图与 Minecraft 查服",
             "· 群聊公用与额度管理",
             "",
             "通过 AGPL-3.0 协议开源",
