@@ -105,6 +105,11 @@ class DeepSeekClient:
     def _is_client_blocked(text: str) -> bool:
         return any(hint in (text or "") for hint in CLIENT_BLOCK_HINTS)
 
+    @staticmethod
+    def _is_retryable_status(status: int) -> bool:
+        """上游 5xx、限流与请求超时属于可重试的临时故障。"""
+        return status >= 500 or status in (408, 429)
+
     def _headers(self, attempt: int = 0) -> dict:
         headers = {
             "Authorization": f"Bearer {self._config.deepseek_api_key}",
@@ -173,6 +178,12 @@ class DeepSeekClient:
                 if self._is_client_blocked(raw) and attempt + 1 < attempts:
                     logger.warning("API 限制当前客户端，换用备用客户端标识重试")
                     await asyncio.sleep(0.6)
+                    continue
+                if self._is_retryable_status(status) and attempt + 1 < attempts:
+                    logger.warning(
+                        "上游返回 HTTP %d，第 %d 次重试", status, attempt + 2
+                    )
+                    await asyncio.sleep(min(3.0, 1.0 * (attempt + 1)))
                     continue
                 raise LLMError(f"DeepSeek 调用失败：HTTP {status} {raw}")
 
@@ -249,6 +260,16 @@ class DeepSeekClient:
                         raw = await resp.text()
                         last_block = raw
                         if self._is_client_blocked(raw) and attempt + 1 < attempts:
+                            retry = True
+                        elif (
+                            self._is_retryable_status(resp.status)
+                            and attempt + 1 < attempts
+                        ):
+                            logger.warning(
+                                "上游返回 HTTP %d，第 %d 次重试",
+                                resp.status,
+                                attempt + 2,
+                            )
                             retry = True
                         else:
                             raise LLMError(

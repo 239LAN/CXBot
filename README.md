@@ -1,7 +1,7 @@
 # CXBot
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.15-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.1.16-blue.svg)](#)
 
 一个运行在 QQ 上的智能助手：接入 QQ Bot API v2，使用 DeepSeek 生成回复，支持流式消息、上下文管理、工具调用、文件空间与积分额度。
 
