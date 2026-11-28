@@ -69,17 +69,18 @@ HELP_COMMON = """基础：
 对话设置：
 /markdown — 查看 Markdown 渲染状态
 /markdown on|off|default — 开/关 Markdown 渲染
-/thinking — 查看思考强度
+/thinking — 查看思考强度与思考显示
 /thinking off|low|medium|high|max|default — 调整思考强度
+/thinking show on|off|default — 开/关思考内容显示
+/progress — 查看过程显示状态
+/progress off|on|default — 关/开过程显示（只显示调用）
 /length — 查看单次输出上限
 /length <tokens>|default — 设置输出上限（不超过管理员上限）
 /context — 查看上下文预算
-/context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）"""
+/context <tokens>|default — 设置上下文 token 上限（不超过管理员上限）
+群聊中只有群主、群管理员或 Bot 管理员可以修改这些设置"""
 
 HELP_PRIVATE = """私聊专属：
-/progress — 查看过程显示状态
-/progress off|on|default — 关/开过程显示（只显示调用）
-/thinking show on|off|default — 开/关思考内容显示
 /stream — 查看流式输出状态
 /stream on|off|default — 开/关流式输出"""
 
@@ -274,19 +275,17 @@ class CommandRouter:
         show = await self._preferences.get(scope, "reasoning") == "on"
 
         if not args:
-            lines = [f"当前思考强度：{self._thinking_label(current)}"]
-            if event.kind == "c2c":
-                lines.append(f"思考显示：{'开启' if show else '关闭'}")
-            else:
-                lines.append("思考显示：群聊不支持")
-            return "\n".join(lines)
+            return (
+                f"当前思考强度：{self._thinking_label(current)}\n"
+                f"思考显示：{'开启' if show else '关闭'}"
+            )
 
         value = args[0].lower()
         if value in ("show", "display", "显示"):
-            if event.kind != "c2c":
-                return "思考显示仅在私聊流式输出中生效。"
             if len(args) < 2 or args[1].lower() not in ("on", "off", "default"):
                 return "用法：/thinking show on|off|default"
+            if not self._can_change_settings(event):
+                return GROUP_SETTINGS_DENIED
             mode = args[1].lower()
             await self._preferences.set(
                 scope, "reasoning", "on" if mode == "on" else None
@@ -310,8 +309,6 @@ class CommandRouter:
     async def _progress_reply(
         self, event: MessageEvent, args: list[str]
     ) -> str:
-        if event.kind != "c2c":
-            return "群聊不支持流式过程显示，该设置仅在私聊生效。"
         scope = event.context_key
         current = await self._preferences.get(scope, "progress")
         if not args:
@@ -323,11 +320,13 @@ class CommandRouter:
         value = args[0].lower()
         if value not in PROGRESS_VALUES:
             return "用法：/progress on|off|default"
+        if not self._can_change_settings(event):
+            return GROUP_SETTINGS_DENIED
         stored = PROGRESS_VALUES[value]
         await self._preferences.set(scope, "progress", stored)
         if stored is None:
             return "过程显示已关闭。"
-        return "过程显示已开启：流式回复中显示命令与工具调用。"
+        return "过程显示已开启：回复中显示命令与工具调用。"
 
     async def _length_reply(
         self, event: MessageEvent, args: list[str]
